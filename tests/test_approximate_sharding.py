@@ -25,7 +25,7 @@ def _fake_2d_mesh():
     )
 
 
-def _tiny_llama3_autop(mesh, solver="ilp"):
+def _tiny_llama3_autop(mesh, solver="ilp", lazy_costs=False):
     vocab_size = 128
     seq_len = 16
     batch_size = 2 * mesh.shape[0]
@@ -49,7 +49,8 @@ def _tiny_llama3_autop(mesh, solver="ilp"):
         param_dtype=torch.bfloat16, reduce_dtype=torch.float32
     )
     return AutoParallel(
-        model, input_fn, mesh, mp_policy, repeated_subgraphs=True, solver=solver
+        model, input_fn, mesh, mp_policy, repeated_subgraphs=True, solver=solver,
+        lazy_costs=lazy_costs,
     )
 
 
@@ -243,3 +244,75 @@ def test_lite_build_matches_full():
 
     assert obj_lite == pytest.approx(obj_full, rel=1e-9)
     assert keys_lite == keys_full
+
+
+@apply_cuda_patches
+@pytest.mark.filterwarnings("ignore:Constructing LpVariable")
+@pytest.mark.parametrize("mesh_shape", [(4, 2), (2, 2, 2)])
+def test_lazy_build_matches_eager(mesh_shape):
+    """The lazy build (lazy_costs=True) defers per-edge cost computation to the
+    approximate solver, which computes only the costs TRW-S touches instead of
+    materializing every decision variable up front. Its assignment must match the
+    eager-approx build: the exact-LB candidate prune reproduces the eager ranking
+    (byte-identical), and the cheap (compute-only) LB must stay within a small gap.
+    """
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda", mesh_shape, mesh_dim_names=tuple(f"d{i}" for i in range(len(mesh_shape)))
+    )
+    placement = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+
+    def solve(lazy_costs, prune_lb=None):
+        with _tiny_llama3_autop(mesh, solver="approx", lazy_costs=lazy_costs) as autop:
+            autop.add_parameter_memory_constraint(low=None, high=None)
+            autop.add_input_constraints([placement])
+            autop.add_output_constraints([placement])
+            opt = autop.sharding_optimizer
+            assert opt.build_costs == (not lazy_costs)
+            if lazy_costs:
+                assert not opt.decision_vars  # no decision vars materialized
+            opts = {"lazy_prune_lb": prune_lb} if prune_lb else None
+            autop.optimize_placement(
+                verbose=False, solver="approx", approximate_options=opts
+            )
+            return (
+                opt.profile["approximate"]["objective"],
+                set(opt.selected_keys),
+            )
+
+    obj_eager, keys_eager = solve(lazy_costs=False)
+    obj_exact, keys_exact = solve(lazy_costs=True, prune_lb="exact")
+    obj_cheap, _ = solve(lazy_costs=True, prune_lb="compute")
+
+    assert math.isfinite(obj_eager) and obj_eager > 0
+    # Exact-LB lazy reproduces the eager candidate ranking -> identical assignment.
+    assert obj_exact == pytest.approx(obj_eager, rel=1e-9)
+    assert keys_exact == keys_eager
+    # Cheap-LB lazy may rank candidates differently but stays close.
+    assert obj_eager - 1e-6 <= obj_cheap <= obj_eager * 1.05 + 1e-6
+
+
+@apply_cuda_patches
+@pytest.mark.filterwarnings("ignore:Constructing LpVariable")
+def test_lazy_build_memory_constrained_matches_eager():
+    """A non-tight memory budget routes both builds through the Lagrangian solve,
+    which uses the lazy cost/ratio providers. The lazy build (exact LB) must reach
+    the same budget-feasible objective as the eager-approx build."""
+    mesh = _fake_2d_mesh()
+    placement = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+
+    def solve(lazy_costs):
+        with _tiny_llama3_autop(mesh, solver="approx", lazy_costs=lazy_costs) as autop:
+            autop.add_parameter_memory_constraint(low=0.0, high=0.5)  # non-tight
+            autop.add_input_constraints([placement])
+            autop.add_output_constraints([(Shard(0), Shard(2))])
+            opt = autop.sharding_optimizer
+            opts = {"lazy_prune_lb": "exact"} if lazy_costs else None
+            autop.optimize_placement(
+                verbose=False, solver="approx", approximate_options=opts
+            )
+            return opt.profile["approximate"]["objective"]
+
+    obj_eager = solve(lazy_costs=False)
+    obj_lazy = solve(lazy_costs=True)
+    assert math.isfinite(obj_eager) and obj_eager > 0
+    assert obj_lazy == pytest.approx(obj_eager, rel=1e-6)

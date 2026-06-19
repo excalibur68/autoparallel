@@ -5,6 +5,7 @@
 
 import copy
 import logging
+import os
 import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -210,6 +211,7 @@ class AutoParallel:
         cost_model: Any = "nccl",
         repeated_subgraphs: bool = True,
         solver: str = "ilp",
+        lazy_costs: bool = False,
     ):
         self.stack = ExitStack()
         # The solver chosen here decides how the optimizer is built: "ilp"/"lp"
@@ -223,6 +225,15 @@ class AutoParallel:
                 f"Unknown solver={solver!r}; expected one of {self.SOLVER_CHOICES}"
             )
         self.solver = solver
+        # Lazy build: defer the per-edge cost estimation to the approximate
+        # solver, which computes only the costs TRW-S touches (build_costs=False).
+        # Only compatible with the approximate solve (ilp/lp need the full costs).
+        self.lazy_costs = lazy_costs or os.environ.get("AP_LAZY_COSTS") == "1"
+        if self.lazy_costs and solver != "approx":
+            raise ValueError(
+                "lazy_costs=True requires solver='approx' (the exact ILP/LP "
+                "solvers need the full edge costs that lazy build skips)."
+            )
         self.fake_mode = (
             FakeTensorMode()
         )  # TODO: maybe need to reuse the model's fake mode
@@ -300,6 +311,7 @@ class AutoParallel:
                 force_grad_reduce_in_higher_precision,
                 repeated_subgraphs=self.repeated_subgraphs,
                 build_pulp=self.solver in ("ilp", "lp"),
+                build_costs=not self.lazy_costs,
             )
 
             self.sharding_optimizer = sharding_optimizer

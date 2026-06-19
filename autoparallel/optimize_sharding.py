@@ -376,6 +376,7 @@ class ShardingOptimizer:
         repeated_subgraphs=False,
         solver_backend="ilp",
         build_pulp=True,
+        build_costs=True,
     ):
         self.orig_gm = gm
         if solver_backend not in {"ilp", "dp"}:
@@ -384,12 +385,19 @@ class ShardingOptimizer:
                 "expected 'ilp' or 'dp'"
             )
         self.solver_backend = solver_backend
+        # When False, skip building the per-edge decision-var costs (Phase A of
+        # _build_decision_vars, the comm-cost estimate over millions of edges that
+        # dominates build). Strategies + cluster_links are still built; the
+        # approximate solver computes the costs it needs on demand (lazy build),
+        # only for the branches TRW-S actually touches. Implies build_pulp=False
+        # (a PuLP problem needs the costs in its objective).
+        self.build_costs = build_costs
         # When False, skip creating PuLP variables and constraints entirely.
         # decision_var costs + strategies + cluster_links are still built, which
         # is all the approximate solver needs (it derives the constraint topology
         # directly). This avoids constructing millions of PuLP objects on large /
         # 3D meshes, where that dominates build time.
-        self.build_pulp = build_pulp
+        self.build_pulp = build_pulp and build_costs
         self.prob = None
         # The optimizer works on a concretized copy of the graph where all
         # symbolic shapes are replaced with their concrete hint values. This
@@ -986,6 +994,9 @@ class ShardingOptimizer:
         built so the approximate solver can treat a key absent from
         ``decision_vars`` as forbidden.
         """
+        if not self.build_costs:
+            return self._build_decision_vars_lazy()
+
         # Precompute which node indices are cluster-linked so we can
         # copy costs from the root instead of recomputing them.
         self._cluster_linked_node_idxs = set(self.cluster_links)
@@ -1118,6 +1129,42 @@ class ShardingOptimizer:
         )
         return decision_vars
 
+    def _build_decision_vars_lazy(self):
+        """Lazy build (build_costs=False): skip the expensive per-edge cost
+        estimation (Phase A) and the DecisionVar/PuLP materialization (Phase B).
+
+        Strategies, cluster_links and the redistribute_cost *shape* (the
+        enumeration dummies) are preserved, which is all the approximate solver
+        needs to derive the topology; it computes the comm/compute costs it
+        actually uses on demand. Returns an empty decision_vars dict — callers
+        that read it (the approx solver) must route through their lazy provider.
+        """
+        self._cluster_linked_node_idxs = set(self.cluster_links)
+        self.pulp_variables = {}
+        self._valid_keys = None
+        self._root_to_copies = defaultdict(list)
+        for copy_idx, root_idx in self.cluster_links.items():
+            self._root_to_copies[root_idx].append(copy_idx)
+        profile = {
+            "logical_decision_variables": 0,
+            "cluster_copied_decision_variables": len(self.cluster_links),
+            "unique_pulp_variables": 0,
+            "pulp_var_creation_s": 0.0,
+            "compute_cost_estimation_s": 0.0,
+            "edge_cost_estimation_s": 0.0,
+            "cost_estimation_s": 0.0,
+        }
+        self._decision_var_profile = profile
+        self.profile["timings"].update(
+            {
+                "pulp_var_creation_s": 0.0,
+                "compute_cost_estimation_s": 0.0,
+                "edge_cost_estimation_s": 0.0,
+                "cost_estimation_s": 0.0,
+            }
+        )
+        return {}
+
     def _compute_node_edge_costs(self, root_idxs):
         """Phase A of _build_decision_vars: per-root-node edge costs. Parallel
         across forked workers when enabled; workers read this optimizer from the
@@ -1156,10 +1203,25 @@ class ShardingOptimizer:
         dv = self.decision_vars.get(key)
         if dv is not None:
             return dv
-        root_key = self._cluster_root_key(key)
-        root_dv = self.decision_vars[root_key]
         node_idx, argi, out_idx, _ = key
         strategy = self.strats[self.nodes[node_idx]].strategies[out_idx]
+        root_key = self._cluster_root_key(key)
+        root_dv = self.decision_vars.get(root_key)
+        if root_dv is None:
+            # Lazy build (build_costs=False): no DecisionVars were materialized.
+            # The approximate solver scores via its own lazy cost provider; here
+            # only .strategy / specs are needed (solution extraction), so the
+            # cost fields are zero placeholders.
+            return DecisionVar(
+                var=None,
+                cost=0.0,
+                compute_cost=0.0,
+                comm_cost=0.0,
+                sharding_transition_cost=0.0,
+                strategy=strategy,
+                output_spec=strategy.output_specs,
+                input_spec=strategy.input_specs[argi],
+            )
         return DecisionVar(
             var=self._get_pulp_variable(key) if self.pulp_variables else None,
             cost=root_dv.cost,

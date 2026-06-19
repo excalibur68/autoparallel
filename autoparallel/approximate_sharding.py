@@ -47,7 +47,10 @@ import torch
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from .cost_models.compute_estimation import _get_sharded_shape_stride
+from .cost_models.compute_estimation import (
+    _get_sharded_shape_stride,
+    estimate_strategy_runtime_cost,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +131,7 @@ class ApproximateShardingSolver:
         star_passes: int = 2,
         max_star_children: int = 32,
         group_domain_limit: int = 512,
+        lazy_prune_lb: str = "compute",
     ):
         self.opt = optimizer
         self.candidate_limit = candidate_limit
@@ -138,6 +142,23 @@ class ApproximateShardingSolver:
         self.star_passes = star_passes
         self.max_star_children = max_star_children
         self.group_domain_limit = group_domain_limit
+
+        # Lazy build: the optimizer was built with build_costs=False, so no
+        # DecisionVars / edge costs exist. We compute the comm/compute costs that
+        # TRW-S touches on demand (memoized) instead of reading opt.decision_vars.
+        self._lazy = not getattr(optimizer, "build_costs", True)
+        if lazy_prune_lb not in ("compute", "exact"):
+            raise ValueError(
+                f"lazy_prune_lb={lazy_prune_lb!r}; expected 'compute' or 'exact'"
+            )
+        self.lazy_prune_lb = lazy_prune_lb
+        # (root v, argi, out_v, out_p) -> (comm_cost, transition_cost)
+        self._edge_cache: dict[tuple, tuple] = {}
+        self._compute_cache: dict[tuple, float] = {}  # (root v, out) -> per-arg compute
+        # Nodes whose redistribution must be forbidden because they precede a
+        # downcasting dtype_cast (the lazy analogue of the per-key dtype forbidden
+        # the eager build stamps); populated in _topology_direct.
+        self._pre_cast_nodes: set[int] = set()
 
         # Populated by _build_problem().
         self.cost_bearing: list[int] = []
@@ -196,7 +217,12 @@ class ApproximateShardingSolver:
                 max((g.domain for g in self.groups), default=0),
             )
 
-        deadline = t0 + self.max_time_s
+        # max_time_s bounds the *solve* (TRW-S + polish), so start the clock after
+        # the build. In the lazy build the per-edge costs are computed during
+        # _build_factors (not up front), which can exceed max_time_s on large
+        # meshes; measuring the deadline from t0 would then starve TRW-S of any
+        # sweeps and decode a near-random assignment.
+        deadline = t_bf + self.max_time_s
         # TRW-S init, then local-search polish. TRW-S reaches the exact MAP on the
         # (integral) sharding problem, so the old greedy second candidate it used
         # to be compared against is strictly dominated and has been dropped; the
@@ -518,6 +544,9 @@ class ApproximateShardingSolver:
                 if node in opt.node_map:
                     fwd_pre_cast.add(opt.node_map[node])
                 node = node.all_input_nodes[0]
+        # In the lazy build there are no decision_vars to stamp, so record the
+        # pre-cast nodes; the lazy edge provider forbids their redistributions.
+        self._pre_cast_nodes.update(fwd_pre_cast)
         for key, dv in opt.decision_vars.items():
             if key[0] in fwd_pre_cast and dv.comm_cost > 0:
                 self.forbidden.add(key)
@@ -546,6 +575,7 @@ class ApproximateShardingSolver:
                 for nd in chain[cast_idx:]:
                     if nd in opt.node_map:
                         pre_cast.add(opt.node_map[nd])
+            self._pre_cast_nodes.update(pre_cast)
             for key, dv in opt.decision_vars.items():
                 if key[0] in pre_cast and dv.comm_cost > 0:
                     self.forbidden.add(key)
@@ -685,7 +715,23 @@ class ApproximateShardingSolver:
         """A strategy edge is forbidden if a constraint ruled it out OR it was
         pruned for infinite cost. Pruning removes such keys from decision_vars
         entirely (see ShardingOptimizer._build_decision_vars), so a key missing
-        from decision_vars is just as forbidden as one in ``self.forbidden``."""
+        from decision_vars is just as forbidden as one in ``self.forbidden``.
+
+        In the lazy build there are no decision_vars, so an infinite-cost edge
+        (an invalid redistribution, which the eager build prunes out of
+        decision_vars) is discovered by computing the edge cost on demand and
+        checking finiteness — same notion of forbidden, just learned lazily.
+        Keeping this in sync with the eager pruning is what lets _out_fully_
+        forbidden and candidate pruning drop the same infeasible strategies."""
+        if self._lazy:
+            if key in self.forbidden:
+                return True
+            v, argi, ov, op = key
+            p = self._arg_prod.get(v, {}).get(argi)
+            if p is None:
+                return False  # producer-less arg: 0-cost dummy, never infinite
+            comm, _trans = self._edge_cost(v, argi, ov, op, p)
+            return not math.isfinite(comm)
         return key in self.forbidden or key not in self.opt.decision_vars
 
     def _surviving_dv(self, v, argi, o):
@@ -854,6 +900,8 @@ class ApproximateShardingSolver:
             group.choices = [group.choices[ci] for ci in sorted(keep)]
 
     def _choice_lower_bound(self, v, node, o):
+        if self._lazy:
+            return self._choice_lower_bound_lazy(v, node, o)
         opt = self.opt
         strat = opt.strats[node].strategies[o]
         mult = self.node_mult[v]
@@ -922,7 +970,12 @@ class ApproximateShardingSolver:
         }
 
     def _param_ratio(self, v, node, o):
-        spec = self._surviving_dv(v, 0, o).input_spec
+        if self._lazy:
+            # input_specs[0] is the param's own (redistributed) spec, identical to
+            # the eager _surviving_dv(v, 0, o).input_spec but without decision_vars.
+            spec = self.opt.strats[node].strategies[o].input_specs[0]
+        else:
+            spec = self._surviving_dv(v, 0, o).input_spec
         new_shape, _ = _get_sharded_shape_stride(spec)
         return math.prod(new_shape) / math.prod(spec.tensor_meta.shape)
 
@@ -974,9 +1027,126 @@ class ApproximateShardingSolver:
         self.C = C
         self.nbrs = [sorted(s) for s in nbr_set]
 
+    # ------------------------------------------------------------------ #
+    # Lazy cost provider (build_costs=False): compute on demand, memoized.
+    # These mirror the eager readers below but call the cost estimators
+    # directly instead of reading opt.decision_vars (which is empty).
+    # ------------------------------------------------------------------ #
+    def _compute_cost(self, m, o):
+        """Per-arg compute cost of node m at output strategy o, matching the
+        eager per_arg_compute = estimate_strategy_runtime_cost / num_args."""
+        ck = (m, o)
+        c = self._compute_cache.get(ck)
+        if c is not None:
+            return c
+        node = self.opt.nodes[m]
+        strats = self.opt.strats[node].strategies
+        num_args = max(len(strats[0].input_specs), 1)
+        c = estimate_strategy_runtime_cost(node, strats[o]) / num_args
+        self._compute_cache[ck] = c
+        return c
+
+    def _edge_cost(self, v, argi, ov, op, p):
+        """(comm_cost, transition_cost) for the edge feeding consumer v's arg
+        argi from producer p, with v at output ov and p at output op. Computed
+        via the same estimator the eager build uses (opt._compute_edge_costs) and
+        memoized. comm is INF for an infeasible redistribution or one forbidden
+        because v precedes a downcasting dtype_cast (lazy analogue of the eager
+        per-key dtype/inf pruning)."""
+        ck = (v, argi, ov, op)
+        cached = self._edge_cache.get(ck)
+        if cached is not None:
+            return cached
+        opt = self.opt
+        node = opt.nodes[v]
+        strat = opt.strats[node].strategies[ov]
+        redist = strat.redistribute_cost[argi]
+        default = redist[op] if op < len(redist) else 0.0
+        prod_strat = opt.strats[opt.nodes[p]]
+        comm, trans = opt._compute_edge_costs(node, strat, argi, op, default, prod_strat)
+        if comm > 0 and v in self._pre_cast_nodes:
+            comm = INF
+        result = (comm, trans)
+        self._edge_cache[ck] = result
+        return result
+
+    def _self_cost_vec_lazy(self, m, out_indices):
+        node = self.opt.nodes[m]
+        strats = self.opt.strats[node].strategies
+        out = np.empty(len(out_indices))
+        for i, o in enumerate(out_indices):
+            # Producer-less args contribute 0 comm/transition in the fast build
+            # (their redistribute_cost is the 0.0 enumeration dummy), so the self
+            # cost is just the per-strategy compute over all args.
+            out[i] = self._compute_cost(m, o) * len(strats[o].redistribute_cost)
+        return out
+
+    def _edge_matrix_lazy(self, v, argi, p):
+        opt = self.opt
+        Kv = len(opt.strats[opt.nodes[v]].strategies)
+        Kp = len(opt.strats[opt.nodes[p]].strategies)
+        R = np.full((Kv, Kp), BIG)
+        gv = self.node_to_group[v]
+        gp = self.node_to_group[p]
+        ov_vals = sorted({c[v] for c in self.groups[gv].choices})
+        op_vals = sorted({c[p] for c in self.groups[gp].choices})
+        for ov in ov_vals:
+            for op in op_vals:
+                if (v, argi, ov, op) in self.forbidden:
+                    continue  # constraint-forbidden; infinite-cost => finite check
+                comm, trans = self._edge_cost(v, argi, ov, op, p)
+                if math.isfinite(comm):
+                    R[ov, op] = comm + trans
+        return R
+
+    def _choice_lower_bound_lazy(self, v, node, o):
+        strat = self.opt.strats[node].strategies[o]
+        mult = self.node_mult[v]
+        lb = self._compute_cost(v, o) * len(strat.redistribute_cost) * mult
+        if self.lazy_prune_lb == "compute":
+            return lb  # compute-only LB (valid since comm, transition >= 0)
+        # Exact LB: add the cheapest feasible comm+transition per producer arg
+        # (computes the full inp range for this out, matching the eager ranking).
+        for argi, p in self.input_edges.get(v, []):
+            best = INF
+            for op in range(len(strat.redistribute_cost[argi])):
+                if self._is_forbidden((v, argi, o, op)):
+                    continue
+                comm, trans = self._edge_cost(v, argi, o, op, p)
+                if math.isfinite(comm):
+                    best = min(best, comm + trans)
+            if math.isfinite(best):
+                lb += mult * best
+        return lb
+
+    def _total_objective_lazy(self):
+        total = 0.0
+        for v in self.cost_bearing:
+            node = self.opt.nodes[v]
+            o = self.cur_out[v]
+            strat = self.opt.strats[node].strategies[o]
+            prod = self._arg_prod.get(v, {})
+            n_args = len(strat.redistribute_cost)
+            c = self._compute_cost(v, o) * n_args
+            for argi in range(n_args):
+                p = prod.get(argi)
+                if p is None:
+                    continue  # producer-less arg: 0 comm/transition (fast build)
+                inp = self.cur_out[p]
+                if self._is_forbidden((v, argi, o, inp)):
+                    return INF
+                comm, trans = self._edge_cost(v, argi, o, inp, p)
+                if not math.isfinite(comm):
+                    return INF
+                c += comm + trans
+            total += self.node_mult[v] * c
+        return total
+
     def _self_cost_vec(self, m, out_indices):
         """Vectorized self-cost (compute + producer-less arg costs) for node m
         over an array of out_idx."""
+        if self._lazy:
+            return self._self_cost_vec_lazy(m, out_indices)
         opt = self.opt
         node = opt.nodes[m]
         prod = self._arg_prod.get(m, {})
@@ -1007,6 +1177,8 @@ class ApproximateShardingSolver:
         """Raw (Kv, Kp) edge cost matrix R[o_v][o_p] = comm + transition, BIG when
         the (o_v, o_p) combination is forbidden. Only entries that can actually be
         indexed by the group choices are filled; the rest are BIG."""
+        if self._lazy:
+            return self._edge_matrix_lazy(v, argi, p)
         opt = self.opt
         Kv = len(opt.strats[opt.nodes[v]].strategies)
         Kp = len(opt.strats[opt.nodes[p]].strategies)
@@ -1496,6 +1668,8 @@ class ApproximateShardingSolver:
     def total_objective(self):
         """Exact objective of the current assignment via decision_vars (for
         verification); equals pulp.value(prob.objective) after write-back."""
+        if self._lazy:
+            return self._total_objective_lazy()
         total = 0.0
         for v in self.cost_bearing:
             node = self.opt.nodes[v]
