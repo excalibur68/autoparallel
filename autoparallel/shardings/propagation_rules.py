@@ -51,6 +51,114 @@ from .dtensor_sharding_helpers import get_op_strategy
 
 logger = logging.getLogger(__name__)
 
+# --- Structural strategy-space pruning (build-time) ---
+# When set to an int r, every generated strategy is restricted to placements
+# that shard (or make Partial) at most r mesh dimensions -- i.e. a radius-r
+# Hamming ball around full replication. This is a purely structural prune (no
+# cost evaluation) applied at strategy-generation time, so it shrinks the
+# per-node strategy count (rows) AND the producer sets (matrix width), which in
+# turn shrinks redistribute-cost generation, pulp variables, decision vars and
+# constraints -- all of which otherwise scale as k^M. None disables pruning.
+_max_sharded_mesh_dims: "int | None" = None
+
+
+def set_max_sharded_mesh_dims(r):
+    global _max_sharded_mesh_dims
+    _max_sharded_mesh_dims = r
+
+
+def get_max_sharded_mesh_dims():
+    return _max_sharded_mesh_dims
+
+
+# --- Seed-centered Hamming-ball strategy generation (build-time) ---
+# Generalizes the replicate-centered shard budget above to an arbitrary per-node
+# center. When a seed (node.name -> placements tuple) + radius is active, each
+# node keeps only the placements within `radius` Hamming distance of its seed.
+# An iterated search can then build ONLY a small ball around a good seed
+# (~1 + M*(k-1) strategies at radius 1) instead of the full k^M, shrinking build
+# AND solve together. _current_seed_node selects which node's seed applies and
+# must be set (set_current_seed_node) before generating each node's strategies.
+# Takes precedence over the shard budget when active. None disables it.
+_strategy_seed: "dict | None" = None
+_strategy_radius: "int | None" = None
+_current_seed_node: "str | None" = None
+
+
+def set_strategy_seed(seed, radius):
+    global _strategy_seed, _strategy_radius
+    _strategy_seed = seed
+    _strategy_radius = radius
+
+
+def get_strategy_seed():
+    return _strategy_seed
+
+
+def set_current_seed_node(name):
+    global _current_seed_node
+    _current_seed_node = name
+
+
+def get_current_seed_node():
+    return _current_seed_node
+
+
+# --- Per-mesh-dim placement restriction (build-time) ---
+# _dim_allowed[m] = set of allowed placement "codes" for mesh dim m ("R","S0",...).
+# Lets a known-role dim (e.g. the data-parallel dim, where the input is batch
+# sharded) be limited to {Replicate, Shard(batch_dim)} so tensor-parallel sharding
+# is forced onto the other dims and the solve collapses to a tractable
+# lower-dimensional one. None disables it.
+_dim_allowed: "dict | None" = None
+
+
+def set_dim_allowed(d):
+    global _dim_allowed
+    _dim_allowed = d
+
+
+def get_dim_allowed():
+    return _dim_allowed
+
+
+def _placement_code(p) -> str:
+    if isinstance(p, Shard):
+        return f"S{p.dim}"
+    if isinstance(p, Partial):
+        return "P"
+    return "R"
+
+
+def within_shard_budget(placements) -> bool:
+    """True if `placements` is kept by the active build-time prune. Per-mesh-dim
+    restriction (if any) is checked first; then seed-ball (radius-r Hamming ball
+    around the current node's seed); else the replicate-centered shard budget;
+    else (all disabled) always True."""
+    if _dim_allowed is not None:
+        for m, allowed in _dim_allowed.items():
+            if _placement_code(placements[m]) not in allowed:
+                return False
+    if _strategy_seed is not None:
+        seed_pl = (
+            _strategy_seed.get(_current_seed_node)
+            if _current_seed_node is not None
+            else None
+        )
+        if seed_pl is not None:
+            # radius may be a global int or a per-node dict (targeted expansion:
+            # only the nodes that pressed against their ball get a larger radius).
+            r = _strategy_radius
+            if isinstance(r, dict):
+                r = r.get(_current_seed_node, 1)
+            return sum(1 for a, b in zip(placements, seed_pl) if a != b) <= r
+        return True  # node absent from the seed: keep all its placements
+    r = _max_sharded_mesh_dims
+    if r is None:
+        return True
+    return sum(1 for p in placements if not p.is_replicate()) <= r
+
+
 # TODO: move this to PyTorch
 dim_maps[torch.t] = lambda input: dim_transpose(input.ndim, -2, -1)
 
@@ -223,6 +331,8 @@ def _create_all_options(mesh, shape, tensor_meta=None, tensor=None):
     all_options = list(itertools.product(*[possible_options for _ in range(mesh.ndim)]))
     strats = []
     for placement in all_options:
+        if not within_shard_budget(placement):
+            continue
         spec = DTensorSpec(mesh, placement, tensor_meta=tensor_meta)
         strats.append(OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]]))
     out_strats = OpStrategy(strats)

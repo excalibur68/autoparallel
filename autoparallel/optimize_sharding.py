@@ -105,7 +105,7 @@ from .graph_passes.graph_utils import (
     build_terminal_derived_set,
 )
 from .shardings.placement_options import get_placement_options_for_node
-from .shardings.propagation_rules import _create_all_options
+from .shardings.propagation_rules import _create_all_options, set_current_seed_node
 
 logger = logging.getLogger(__name__)
 
@@ -377,6 +377,10 @@ class ShardingOptimizer:
         solver_backend="ilp",
         build_pulp=True,
         build_costs=True,
+        strategy_seed=None,
+        strategy_radius=1,
+        max_sharded_mesh_dims=None,
+        dim_allowed=None,
     ):
         self.orig_gm = gm
         if solver_backend not in {"ilp", "dp"}:
@@ -398,6 +402,16 @@ class ShardingOptimizer:
         # directly). This avoids constructing millions of PuLP objects on large /
         # 3D meshes, where that dominates build time.
         self.build_pulp = build_pulp and build_costs
+        # Opt-in build-time strategy-space prune (fast_solver seed-ball + siblings).
+        # strategy_seed: {node.name -> placements tuple} or callable(graph)->dict;
+        # keeps only each node's placements within strategy_radius Hamming distance
+        # of its seed. max_sharded_mesh_dims (radius-r ball around full replication)
+        # and dim_allowed (per-mesh-dim placement restriction) are the siblings.
+        # All None => default full enumeration (byte-identical to the pre-seed path).
+        self.strategy_seed = strategy_seed
+        self.strategy_radius = strategy_radius
+        self.max_sharded_mesh_dims = max_sharded_mesh_dims
+        self.dim_allowed = dim_allowed
         self.prob = None
         # The optimizer works on a concretized copy of the graph where all
         # symbolic shapes are replaced with their concrete hint values. This
@@ -441,7 +455,38 @@ class ShardingOptimizer:
         }
         t_init_start = time.perf_counter()
         t0 = time.perf_counter()
-        self.strats = self.build_sharding_metadata()
+        if callable(self.strategy_seed):
+            self.strategy_seed = self.strategy_seed(self.graph)
+        if (
+            self.strategy_seed is not None
+            or self.max_sharded_mesh_dims is not None
+            or self.dim_allowed is not None
+        ):
+            # Build-time prune active: install the per-node restriction in
+            # propagation_rules' module state, then tear it down in finally so it
+            # never leaks into another optimizer instance or apply_sharding.
+            # (Enumeration's redistribute costs are already stubbed inside
+            # build_sharding_metadata via _skip_enumeration_redistribute_cost.)
+            from .shardings import propagation_rules as _prop_rules
+            from .shardings.placement_options import reset_placement_options_cache
+
+            if self.strategy_seed is not None:
+                _prop_rules.set_strategy_seed(self.strategy_seed, self.strategy_radius)
+            elif self.max_sharded_mesh_dims is not None:
+                _prop_rules.set_max_sharded_mesh_dims(self.max_sharded_mesh_dims)
+            if self.dim_allowed is not None:
+                _prop_rules.set_dim_allowed(self.dim_allowed)
+            reset_placement_options_cache()
+            try:
+                self.strats = self.build_sharding_metadata()
+            finally:
+                _prop_rules.set_strategy_seed(None, self.strategy_radius)
+                _prop_rules.set_max_sharded_mesh_dims(None)
+                _prop_rules.set_current_seed_node(None)
+                _prop_rules.set_dim_allowed(None)
+                reset_placement_options_cache()
+        else:
+            self.strats = self.build_sharding_metadata()
         t_strategy = time.perf_counter() - t0
         self.profile["timings"]["strategy_enumeration_s"] = t_strategy
         self.profile["strategies"] = self._profile_strategies()
@@ -771,6 +816,7 @@ class ShardingOptimizer:
         # _skip_enumeration_redistribute_cost).
         with _skip_enumeration_redistribute_cost():
             for node in self.graph.nodes:
+                set_current_seed_node(node.name)
                 if node.op in ("placeholder", "get_attr"):
                     val = node.meta.get("val")
                     if isinstance(val, torch.Tensor):

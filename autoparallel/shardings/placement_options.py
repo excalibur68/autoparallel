@@ -30,7 +30,15 @@ from torch.utils._pytree import tree_flatten, tree_map_only
 from autoparallel.shardings.propagation_rules import generate_dummy_redistribute_costs
 
 from .dtensor_sharding_helpers import get_op_strategy, with_implicit_strategies
-from .propagation_rules import _op_rules, remove_invalid_configs
+from .propagation_rules import (
+    _op_rules,
+    get_current_seed_node,
+    get_dim_allowed,
+    get_max_sharded_mesh_dims,
+    get_strategy_seed,
+    remove_invalid_configs,
+    within_shard_budget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -276,6 +284,35 @@ def reset_placement_options_timer():
     _placement_options_timer = PlacementOptionsTimer()
 
 
+def _filter_out_strat_by_budget(out_strat):
+    """Drop output strategies whose placements are pruned by the active
+    build-time prune (seed-ball or shard budget; see
+    propagation_rules.within_shard_budget). Never empties a node: if all
+    strategies are pruned the original is returned unchanged."""
+    if (
+        get_max_sharded_mesh_dims() is None
+        and get_strategy_seed() is None
+        and get_dim_allowed() is None
+    ):
+        return out_strat
+    kept = []
+    for s in out_strat.strategies:
+        out = s.output_specs
+        placements = None
+        if isinstance(out, (tuple, list)):
+            for o in out:
+                if isinstance(o, DTensorSpec):
+                    placements = o.placements
+                    break
+        elif isinstance(out, DTensorSpec):
+            placements = out.placements
+        if placements is None or within_shard_budget(placements):
+            kept.append(s)
+    if not kept:
+        return out_strat
+    return OpStrategy(kept)
+
+
 def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     assert len(specs) == len(user_args)
     timer = _placement_options_timer
@@ -287,6 +324,11 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
         # cache key; using only shape/ndim would return specs attached to a
         # different candidate mesh during mesh-shape sweeps.
         mesh_key = (id(mesh), mesh.device_type, tuple(mesh.shape), mesh.ndim)
+        # In seed-ball mode the output is filtered to the current node's seed
+        # ball, so the cache must key on that seed placement (nodes with the same
+        # seed + same producer specs still share, e.g. clustered repeats).
+        seed = get_strategy_seed()
+        seed_key = seed.get(get_current_seed_node()) if seed is not None else None
         cache_key = (
             mesh_key,
             op,
@@ -295,6 +337,7 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
             tuple(_fingerprint_arg(v) for v in user_kwargs.values())
             if user_kwargs
             else (),
+            seed_key,
         )
         hash(cache_key)  # fail fast if key contains unhashable types (e.g. SymInts)
     except TypeError:
@@ -331,6 +374,7 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     else:
         with with_implicit_strategies():
             out_strat = get_op_strategy(op, op_schema)
+    out_strat = _filter_out_strat_by_budget(out_strat)
     t1 = time.perf_counter()
 
     # operator.getitem is self-contained: its input is a tuple of tensors
