@@ -282,7 +282,13 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     t_start = time.perf_counter()
 
     try:
+        # OpStrategies contain DTensorSpecs, and DTensorSpecs retain the
+        # concrete DeviceMesh object.  The mesh id is therefore part of the
+        # cache key; using only shape/ndim would return specs attached to a
+        # different candidate mesh during mesh-shape sweeps.
+        mesh_key = (id(mesh), mesh.device_type, tuple(mesh.shape), mesh.ndim)
         cache_key = (
+            mesh_key,
             op,
             tuple(_fingerprint_arg(s) for s in specs),
             tuple(_fingerprint_arg(a) for a in user_args),

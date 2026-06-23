@@ -237,7 +237,14 @@ def reset_comms_cost_cache():
 
 
 def estimate_strategy_comms_cost(src_spec, tgt_spec):
+    mesh = src_spec.mesh
+    tgt_mesh = tgt_spec.mesh
     key = (
+        id(mesh),
+        id(tgt_mesh),
+        mesh.device_type,
+        tuple(mesh.shape),
+        tuple(tgt_mesh.shape),
         src_spec.placements,
         src_spec.tensor_meta,
         tgt_spec.placements,

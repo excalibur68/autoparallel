@@ -449,7 +449,8 @@ def estimate_strategy_runtime_cost(node, strategy):
     cache_key = None
     if strategy is not None:
         input_specs_key = tuple(
-            (s.placements, s.tensor_meta) for s in strategy.input_specs
+            (s.mesh.device_type, tuple(s.mesh.shape), s.placements, s.tensor_meta)
+            for s in strategy.input_specs
         )
         try:
             non_tensor_args = tuple(
