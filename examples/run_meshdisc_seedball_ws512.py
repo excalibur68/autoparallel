@@ -29,7 +29,11 @@ from autoparallel.api import AutoParallel
 from autoparallel.approximate_sharding import ApproximateShardingSolver
 from autoparallel.cost_models.collective_runtime_estimation import set_nccl_topo_config
 from autoparallel.cost_models.nccl_cost_model import h100_topo_config
-from autoparallel.mesh_search import reset_mesh_search_caches
+from autoparallel.mesh_search import (
+    build_factored_seed,
+    reset_mesh_search_caches,
+    seed_ball_approx_kwargs,
+)
 from autoparallel.optimize_sharding import ShardingOptimizer
 
 # Set by the parent in main() and read by spawned workers via the initializer args.
@@ -92,36 +96,17 @@ def worker_init(cfg):
     _G["radius"] = cfg["radius"]
     # bf16 params + fp32 grad reduction => reduce in higher precision.
     _G["force_grad_reduce"] = True
-
-
-def make_seed_builder(ndim, x_sharding):
-    """A callable(graph)->{node.name: placements} 'rep' seed: every node centered at
-    full Replicate, with plain input/output (+ grad/tangent) nodes pinned to the IO
-    constraint placement so the seed-ball never excludes the constrained placement."""
-
-    def build_seed(graph):
-        from torch._functorch._aot_autograd.fx_utils import (
-            get_plain_input_and_grad_nodes,
-            get_plain_output_and_tangent_nodes,
-        )
-
-        rep = (Replicate(),) * ndim
-        seed = {n.name: rep for n in graph.nodes if n.op != "output"}
-        for _desc, (node, comp) in get_plain_input_and_grad_nodes(graph).items():
-            seed[node.name] = x_sharding
-            if comp is not None:
-                seed[comp.name] = x_sharding
-        for _desc, (node, comp) in get_plain_output_and_tangent_nodes(graph).items():
-            seed[node.name] = x_sharding
-            if comp is not None:
-                seed[comp.name] = x_sharding
-        return seed
-
-    return build_seed
+    # Per-worker cache of 1D factored-seed solves, keyed by (dim_size, input
+    # placement); amortizes the per-dim 1D ILP across candidates sharing a dim.
+    _G["seed_cache"] = {}
 
 
 def eval_candidate(shape):
-    """Build a lazy seed-ball ShardingOptimizer for `shape` and solve with TRW-S."""
+    """Factored-seed-ball ShardingOptimizer for `shape`, solved with TRW-S (lazy build).
+
+    Seed = per-mesh-dim 1D exact solves (cached per dim), centering the radius-r ball
+    at a per-dim-optimal point; raised TRW-S caps avoid 3D group truncation.
+    """
     gm = _G["gm"]
     ndim = len(shape)
     names = ("dp", "cp", "tp") if ndim == 3 else tuple(f"d{i}" for i in range(ndim))
@@ -131,14 +116,24 @@ def eval_candidate(shape):
             mesh = torch.distributed.device_mesh.init_device_mesh(
                 "cuda", shape, mesh_dim_names=names
             )
+        # Factored seed (per-dim 1D solves; manages + restores the topo internally).
+        t = time.perf_counter()
+        seed = build_factored_seed(
+            gm, tuple(shape), x_sharding,
+            cost_model=_G["topo"],
+            force_grad_reduce_in_higher_precision=_G["force_grad_reduce"],
+            repeated_subgraphs=True,
+            one_d_cache=_G["seed_cache"],
+        )
+        seed_s = time.perf_counter() - t
+
         set_nccl_topo_config(_G["topo"])
         reset_mesh_search_caches()
-
         t = time.perf_counter()
         opt = ShardingOptimizer(
             gm, mesh, _G["force_grad_reduce"], repeated_subgraphs=True,
             build_costs=False,
-            strategy_seed=make_seed_builder(ndim, x_sharding),
+            strategy_seed=seed,
             strategy_radius=_G["radius"],
         )
         opt.add_sharded_input_constraint([x_sharding])
@@ -147,7 +142,7 @@ def eval_candidate(shape):
         build_s = time.perf_counter() - t
 
         t = time.perf_counter()
-        ApproximateShardingSolver(opt).get_solution()
+        ApproximateShardingSolver(opt, **seed_ball_approx_kwargs(ndim)).get_solution()
         solve_s = time.perf_counter() - t
 
         n_strats = sum(
@@ -156,7 +151,7 @@ def eval_candidate(shape):
         return {
             "shape": list(shape), "feasible": True,
             "objective": float(opt.profile["approximate"]["objective"]),
-            "build_s": build_s, "solve_s": solve_s, "n_strats": n_strats,
+            "seed_s": seed_s, "build_s": build_s, "solve_s": solve_s, "n_strats": n_strats,
         }
     except Exception as exc:  # noqa: BLE001 - report per-candidate failures, keep going
         return {"shape": list(shape), "feasible": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -182,7 +177,7 @@ def main():
     print(
         f"3D mesh discovery: world_size={args.world_size} candidates={len(cands)} "
         f"workers={workers} model=llama3(dim2048,n_layers={args.n_layers}) "
-        f"seq={args.seq_len} solver=seedball-r{args.radius}+TRWS+lazy"
+        f"seq={args.seq_len} solver=factored-seedball-r{args.radius}+TRWS+lazy"
     )
 
     t0 = time.perf_counter()
@@ -197,11 +192,11 @@ def main():
     infeasible = [r for r in results if not r["feasible"]]
 
     print(f"\n=== results (wall={wall:.1f}s, {len(feasible)}/{len(cands)} feasible) ===")
-    print(f"{'mesh':>16} {'objective':>14} {'build_s':>8} {'solve_s':>8} {'n_strats':>9}")
+    print(f"{'mesh':>16} {'objective':>14} {'seed_s':>7} {'build_s':>8} {'solve_s':>8} {'n_strats':>9}")
     for r in feasible:
         print(
             f"{str(tuple(r['shape'])):>16} {r['objective']:>14.1f} "
-            f"{r['build_s']:>8.1f} {r['solve_s']:>8.1f} {r['n_strats']:>9}"
+            f"{r['seed_s']:>7.1f} {r['build_s']:>8.1f} {r['solve_s']:>8.1f} {r['n_strats']:>9}"
         )
     for r in infeasible:
         print(f"{str(tuple(r['shape'])):>16} INFEASIBLE {r['error']}")

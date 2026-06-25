@@ -16,6 +16,7 @@ import pulp
 import torch
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_flatten
 
@@ -548,6 +549,126 @@ def _add_parameter_memory_constraint(
     if high is None:
         high = 1.0 / mesh.size()
     opt.add_parameter_memory_constraint(low, high)
+
+
+def _placement_code(p: Placement) -> str:
+    if isinstance(p, Shard):
+        return f"S{p.dim}"
+    if isinstance(p, Replicate):
+        return "R"
+    return type(p).__name__
+
+
+def _first_output_placements(output_specs) -> Optional[tuple[Placement, ...]]:
+    if isinstance(output_specs, DTensorSpec):
+        return output_specs.placements
+    if isinstance(output_specs, (tuple, list)):
+        for o in output_specs:
+            if isinstance(o, DTensorSpec):
+                return o.placements
+    return None
+
+
+def seed_ball_approx_kwargs(ndim: int, max_time_s: float = 600.0) -> dict[str, Any]:
+    """TRW-S knobs for the seed-ball solve.  The defaults (group_domain_limit=512,
+    candidate_limit=64) are sized for ~2D and silently truncate on 3D+ (each node
+    has ~(1+tensor_ndim)**ndim strategies), degrading quality.  Raise them for 3D+."""
+    kwargs: dict[str, Any] = {"max_time_s": max_time_s}
+    if ndim >= 3:
+        kwargs.update(
+            group_domain_limit=100000, candidate_limit=4096, max_star_children=512
+        )
+    return kwargs
+
+
+def build_factored_seed(
+    gm: torch.fx.GraphModule,
+    mesh_shape: tuple[int, ...],
+    input_placements: tuple[Placement, ...],
+    *,
+    cost_model: Any = "nccl",
+    force_grad_reduce_in_higher_precision: bool = False,
+    repeated_subgraphs: bool = True,
+    memory_high_fn: Optional[Callable[[int], float]] = None,
+    one_d_cache: Optional[dict[tuple[int, str], dict[str, Placement]]] = None,
+    device_type: str = "cuda",
+) -> dict[str, tuple[Placement, ...]]:
+    """Build a per-node "factored" seed for the seed-ball search.
+
+    Each mesh dim is solved as an INDEPENDENT 1D exact ILP whose input is pinned to
+    ``input_placements[i]``; the chosen per-node output placements are stacked into a
+    per-node tuple.  Used as ``strategy_seed`` (with a small radius), this centers the
+    seed-ball at a per-dim-optimal point so a joint TRW-S re-optimization within the
+    ball recovers the cross-dim interactions the independent 1D solves miss.
+
+    Plain input/output (and their grad/tangent) nodes are pinned to
+    ``input_placements`` so the radius-r ball can never exclude the IO constraint
+    (which would make the candidate infeasible).
+
+    1D solves are cached in ``one_d_cache`` by ``(dim_size, input placement code)`` so
+    they amortize across candidate meshes that share a dim size + input placement.
+    """
+    ndim = len(mesh_shape)
+    if len(input_placements) != ndim:
+        raise ValueError(
+            f"input_placements has {len(input_placements)} entries, expected {ndim}"
+        )
+    if memory_high_fn is None:
+        memory_high_fn = lambda size: 1.0 / size  # noqa: E731
+    cache = one_d_cache if one_d_cache is not None else {}
+
+    per_dim: list[dict[str, Placement]] = []
+    for i, size in enumerate(mesh_shape):
+        pl_in = input_placements[i]
+        key = (int(size), _placement_code(pl_in))
+        if key not in cache:
+            with unset_fake_temporarily():
+                mesh_1d = init_device_mesh(device_type, (int(size),), mesh_dim_names=("d",))
+            prev = get_nccl_topo_config()
+            try:
+                _set_cost_model_for_mesh(mesh_1d, cost_model)
+                reset_mesh_search_caches()
+                opt = ShardingOptimizer(
+                    gm,
+                    mesh_1d,
+                    force_grad_reduce_in_higher_precision,
+                    repeated_subgraphs=repeated_subgraphs,
+                )
+                opt.add_sharded_input_constraint([(pl_in,)])
+                opt.add_sharded_output_constraint([(pl_in,)])
+                opt.add_parameter_memory_constraint(0.0, memory_high_fn(int(size)))
+                solution = opt.get_solution()
+            finally:
+                set_nccl_topo_config(prev)
+            node_pl: dict[str, Placement] = {}
+            for node, strat in solution.items():
+                placements = _first_output_placements(strat.output_specs)
+                if placements is not None:
+                    node_pl[node.name] = placements[0]
+            cache[key] = node_pl
+        per_dim.append(cache[key])
+
+    seed: dict[str, tuple[Placement, ...]] = {}
+    for node in gm.graph.nodes:
+        if node.op == "output":
+            continue
+        seed[node.name] = tuple(
+            per_dim[i].get(node.name, Replicate()) for i in range(ndim)
+        )
+
+    # Pin IO (+grad/tangent) nodes to the constraint placement so the ball keeps it.
+    from torch._functorch._aot_autograd.fx_utils import (
+        get_plain_input_and_grad_nodes,
+        get_plain_output_and_tangent_nodes,
+    )
+
+    io_pl = tuple(input_placements)
+    for getter in (get_plain_input_and_grad_nodes, get_plain_output_and_tangent_nodes):
+        for _desc, (node, comp) in getter(gm.graph).items():
+            seed[node.name] = io_pl
+            if comp is not None:
+                seed[comp.name] = io_pl
+    return seed
 
 
 def evaluate_mesh_candidate(
