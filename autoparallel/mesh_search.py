@@ -572,8 +572,7 @@ def _factored_seed_dim_cost_model(
     topo = derive_mesh_dim_topo(cost_model, mesh_shape, dim_idx)
     return replace(
         cost_model,
-        num_nodes=topo.n_nodes,
-        gpus_per_node=topo.ppn,
+        mesh_dim_topo_override=topo,
     )
 
 
@@ -597,6 +596,11 @@ def _factored_seed_cache_key(
             int(size),
             placement,
             cost_model.arch.name,
+            cost_model.num_nodes,
+            cost_model.gpus_per_node,
+            cost_model.bw_intra,
+            cost_model.bw_inter,
+            cost_model.num_channels,
             topo.n_nodes,
             topo.ppn,
             topo.bw_intra,

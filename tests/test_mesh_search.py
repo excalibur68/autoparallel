@@ -9,6 +9,10 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from autoparallel.cost_models.nccl_cost_model import (
     derive_mesh_dim_topo,
     h100_topo_config,
+    nccl_all_to_all_cost,
+    nccl_allgather_cost,
+    nccl_allreduce_cost,
+    nccl_reduce_scatter_cost,
 )
 from autoparallel.mesh_search import (
     _factored_seed_cache_key,
@@ -165,6 +169,8 @@ def test_factored_seed_dim_cost_model_preserves_original_mesh_dim_topology():
         one_d_topo = derive_mesh_dim_topo(dim_config, (mesh_shape[dim_idx],), 0)
 
         assert one_d_topo == original_topo
+        assert dim_config.num_nodes == config.num_nodes
+        assert dim_config.gpus_per_node == config.gpus_per_node
 
     dim0_topo = derive_mesh_dim_topo(config, mesh_shape, 0)
     dim1_topo = derive_mesh_dim_topo(config, mesh_shape, 1)
@@ -173,6 +179,43 @@ def test_factored_seed_dim_cost_model_preserves_original_mesh_dim_topology():
     assert (dim0_topo.n_nodes, dim0_topo.ppn) == (8, 1)
     assert (dim1_topo.n_nodes, dim1_topo.ppn) == (8, 1)
     assert (dim2_topo.n_nodes, dim2_topo.ppn) == (1, 8)
+
+
+def test_factored_seed_hybrid_dim_matches_full_mesh_collective_costs():
+    config = h100_topo_config(num_nodes=64, gpus_per_node=8)
+    mesh_shape = (16, 8, 4)
+    dim_idx = 1
+    full_topo = derive_mesh_dim_topo(config, mesh_shape, dim_idx)
+    dim_config = _factored_seed_dim_cost_model(
+        config, mesh_shape, dim_idx, fabric_aware=True
+    )
+    one_d_topo = derive_mesh_dim_topo(dim_config, (mesh_shape[dim_idx],), 0)
+
+    assert (full_topo.n_nodes, full_topo.ppn) == (4, 2)
+    assert one_d_topo == full_topo
+    assert dim_config.num_nodes == config.num_nodes
+    assert dim_config.gpus_per_node == config.gpus_per_node
+
+    n_bytes = 1024**3
+    for cost_fn in (
+        nccl_allgather_cost,
+        nccl_reduce_scatter_cost,
+        nccl_allreduce_cost,
+        nccl_all_to_all_cost,
+    ):
+        assert cost_fn(n_bytes, one_d_topo, dim_config) == cost_fn(
+            n_bytes, full_topo, config
+        )
+
+
+def test_factored_seed_topology_override_only_applies_to_matching_1d_mesh():
+    config = h100_topo_config(num_nodes=64, gpus_per_node=8)
+    dim_config = _factored_seed_dim_cost_model(config, (16, 8, 4), 1, fabric_aware=True)
+
+    with pytest.raises(ValueError, match="1D dim0"):
+        derive_mesh_dim_topo(dim_config, (2, 4), 0)
+    with pytest.raises(ValueError, match="n_ranks"):
+        derive_mesh_dim_topo(dim_config, (4,), 0)
 
 
 def test_factored_seed_cache_key_separates_same_size_different_fabric():
@@ -194,6 +237,24 @@ def test_factored_seed_cache_key_separates_same_size_different_fabric():
 
     assert rdma_key != nvlink_key
     assert blind_rdma_key == blind_nvlink_key
+
+
+def test_factored_seed_cache_key_includes_physical_topology():
+    config = h100_topo_config(num_nodes=64, gpus_per_node=8)
+    physical_2gpu_config = h100_topo_config(num_nodes=4, gpus_per_node=2)
+
+    hybrid_topo = derive_mesh_dim_topo(config, (16, 8, 4), 1)
+    physical_2gpu_topo = derive_mesh_dim_topo(physical_2gpu_config, (8,), 0)
+    assert hybrid_topo == physical_2gpu_topo
+
+    hybrid_key = _factored_seed_cache_key(
+        8, Replicate(), config, (16, 8, 4), 1, fabric_aware=True
+    )
+    physical_2gpu_key = _factored_seed_cache_key(
+        8, Replicate(), physical_2gpu_config, (8,), 0, fabric_aware=True
+    )
+
+    assert hybrid_key != physical_2gpu_key
 
 
 def test_factored_seed_cache_key_includes_input_placement():
