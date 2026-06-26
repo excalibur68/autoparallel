@@ -559,6 +559,56 @@ def _placement_code(p: Placement) -> str:
     return type(p).__name__
 
 
+def _factored_seed_dim_cost_model(
+    cost_model: Any,
+    mesh_shape: tuple[int, ...],
+    dim_idx: int,
+    *,
+    fabric_aware: bool,
+) -> Any:
+    if not fabric_aware or not isinstance(cost_model, NCCLTopoConfig):
+        return cost_model
+
+    topo = derive_mesh_dim_topo(cost_model, mesh_shape, dim_idx)
+    return replace(
+        cost_model,
+        num_nodes=topo.n_nodes,
+        gpus_per_node=topo.ppn,
+    )
+
+
+def _factored_seed_cache_key(
+    size: int,
+    input_placement: Placement,
+    cost_model: Any,
+    mesh_shape: tuple[int, ...],
+    dim_idx: int,
+    *,
+    fabric_aware: bool,
+) -> tuple[Any, ...]:
+    placement = _placement_code(input_placement)
+    if isinstance(cost_model, NCCLTopoConfig):
+        dim_cost_model = _factored_seed_dim_cost_model(
+            cost_model, mesh_shape, dim_idx, fabric_aware=fabric_aware
+        )
+        topo = derive_mesh_dim_topo(dim_cost_model, (int(size),), 0)
+        return (
+            "nccl",
+            int(size),
+            placement,
+            cost_model.arch.name,
+            topo.n_nodes,
+            topo.ppn,
+            topo.bw_intra,
+            topo.bw_inter,
+            topo.n_channels,
+            dim_cost_model.has_nvswitch,
+            dim_cost_model.has_collnet,
+            dim_cost_model.net_latency,
+        )
+    return (str(cost_model), int(size), placement)
+
+
 def _first_output_placements(output_specs) -> Optional[tuple[Placement, ...]]:
     if isinstance(output_specs, DTensorSpec):
         return output_specs.placements
@@ -590,8 +640,9 @@ def build_factored_seed(
     force_grad_reduce_in_higher_precision: bool = False,
     repeated_subgraphs: bool = True,
     memory_high_fn: Optional[Callable[[int], float]] = None,
-    one_d_cache: Optional[dict[tuple[int, str], dict[str, Placement]]] = None,
+    one_d_cache: Optional[dict[tuple[Any, ...], dict[str, Placement]]] = None,
     device_type: str = "cuda",
+    fabric_aware: bool = True,
 ) -> dict[str, tuple[Placement, ...]]:
     """Build a per-node "factored" seed for the seed-ball search.
 
@@ -605,8 +656,14 @@ def build_factored_seed(
     ``input_placements`` so the radius-r ball can never exclude the IO constraint
     (which would make the candidate infeasible).
 
-    1D solves are cached in ``one_d_cache`` by ``(dim_size, input placement code)`` so
-    they amortize across candidate meshes that share a dim size + input placement.
+    For NCCL cost models, each 1D solve uses the topology of the corresponding
+    original mesh dimension when a topology is explicit or can be detected.  This
+    keeps, for example, a size-8 cross-node dimension distinct from a size-8
+    node-local dimension.
+
+    1D solves are cached in ``one_d_cache`` by dim size, input placement, and cost
+    model topology so they amortize across candidate meshes only when the 1D ILP is
+    solving the same fabric.
     """
     ndim = len(mesh_shape)
     if len(input_placements) != ndim:
@@ -616,17 +673,38 @@ def build_factored_seed(
     if memory_high_fn is None:
         memory_high_fn = lambda size: 1.0 / size  # noqa: E731
     cache = one_d_cache if one_d_cache is not None else {}
+    seed_cost_model = cost_model
+    if fabric_aware and cost_model == "nccl":
+        with unset_fake_temporarily():
+            full_mesh = init_device_mesh(
+                device_type,
+                mesh_shape,
+                mesh_dim_names=tuple(f"d{i}" for i in range(ndim)),
+            )
+        seed_cost_model = detect_nccl_topo_config(full_mesh)
 
     per_dim: list[dict[str, Placement]] = []
     for i, size in enumerate(mesh_shape):
         pl_in = input_placements[i]
-        key = (int(size), _placement_code(pl_in))
+        key = _factored_seed_cache_key(
+            int(size),
+            pl_in,
+            seed_cost_model,
+            mesh_shape,
+            i,
+            fabric_aware=fabric_aware,
+        )
         if key not in cache:
             with unset_fake_temporarily():
-                mesh_1d = init_device_mesh(device_type, (int(size),), mesh_dim_names=("d",))
+                mesh_1d = init_device_mesh(
+                    device_type, (int(size),), mesh_dim_names=("d",)
+                )
             prev = get_nccl_topo_config()
             try:
-                _set_cost_model_for_mesh(mesh_1d, cost_model)
+                dim_cost_model = _factored_seed_dim_cost_model(
+                    seed_cost_model, mesh_shape, i, fabric_aware=fabric_aware
+                )
+                _set_cost_model_for_mesh(mesh_1d, dim_cost_model)
                 reset_mesh_search_caches()
                 opt = ShardingOptimizer(
                     gm,
@@ -801,7 +879,9 @@ def format_mesh_evaluations(evaluations: list[MeshEvaluation]) -> str:
     ]
     for e in evaluations:
         c = e.candidate
-        axes = ",".join(f"{name}={size}" for name, size in c.semantic_axis_sizes.items())
+        axes = ",".join(
+            f"{name}={size}" for name, size in c.semantic_axis_sizes.items()
+        )
         if not e.feasible:
             lines.append(
                 f"{c.mesh_shape} {c.mesh_dim_names} {axes} "

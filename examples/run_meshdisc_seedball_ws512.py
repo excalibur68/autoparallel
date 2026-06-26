@@ -96,16 +96,17 @@ def worker_init(cfg):
     _G["radius"] = cfg["radius"]
     # bf16 params + fp32 grad reduction => reduce in higher precision.
     _G["force_grad_reduce"] = True
-    # Per-worker cache of 1D factored-seed solves, keyed by (dim_size, input
-    # placement); amortizes the per-dim 1D ILP across candidates sharing a dim.
+    # Per-worker cache of 1D factored-seed solves, keyed by dim size, input
+    # placement, and derived fabric; amortizes only equivalent 1D ILPs.
     _G["seed_cache"] = {}
 
 
 def eval_candidate(shape):
     """Factored-seed-ball ShardingOptimizer for `shape`, solved with TRW-S (lazy build).
 
-    Seed = per-mesh-dim 1D exact solves (cached per dim), centering the radius-r ball
-    at a per-dim-optimal point; raised TRW-S caps avoid 3D group truncation.
+    Seed = fabric-aware per-mesh-dim 1D exact solves (cached per equivalent dim),
+    centering the radius-r ball at a per-dim-optimal point; raised TRW-S caps avoid
+    3D group truncation.
     """
     gm = _G["gm"]
     ndim = len(shape)

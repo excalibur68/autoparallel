@@ -4,10 +4,17 @@
 
 import pytest
 import torch
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from autoparallel.cost_models.nccl_cost_model import (
+    derive_mesh_dim_topo,
+    h100_topo_config,
+)
 from autoparallel.mesh_search import (
-    generate_dp_tp_mesh_candidates,
+    _factored_seed_cache_key,
+    _factored_seed_dim_cost_model,
     generate_2d_semantic_mesh_candidates,
+    generate_dp_tp_mesh_candidates,
     generate_semantic_mesh_candidates,
     make_axis_placement,
     rank_mesh_candidates,
@@ -144,3 +151,60 @@ def test_make_axis_placement_uses_mesh_dim_names():
 
     assert candidate.mesh_dim_names == ("dp", "cp", "tp")
     assert [str(p) for p in placement] == ["S(0)", "S(1)", "S(2)"]
+
+
+def test_factored_seed_dim_cost_model_preserves_original_mesh_dim_topology():
+    config = h100_topo_config(num_nodes=64, gpus_per_node=8)
+    mesh_shape = (8, 8, 8)
+
+    for dim_idx in range(3):
+        dim_config = _factored_seed_dim_cost_model(
+            config, mesh_shape, dim_idx, fabric_aware=True
+        )
+        original_topo = derive_mesh_dim_topo(config, mesh_shape, dim_idx)
+        one_d_topo = derive_mesh_dim_topo(dim_config, (mesh_shape[dim_idx],), 0)
+
+        assert one_d_topo == original_topo
+
+    dim0_topo = derive_mesh_dim_topo(config, mesh_shape, 0)
+    dim1_topo = derive_mesh_dim_topo(config, mesh_shape, 1)
+    dim2_topo = derive_mesh_dim_topo(config, mesh_shape, 2)
+
+    assert (dim0_topo.n_nodes, dim0_topo.ppn) == (8, 1)
+    assert (dim1_topo.n_nodes, dim1_topo.ppn) == (8, 1)
+    assert (dim2_topo.n_nodes, dim2_topo.ppn) == (1, 8)
+
+
+def test_factored_seed_cache_key_separates_same_size_different_fabric():
+    config = h100_topo_config(num_nodes=64, gpus_per_node=8)
+    mesh_shape = (8, 8, 8)
+
+    rdma_key = _factored_seed_cache_key(
+        8, Replicate(), config, mesh_shape, 1, fabric_aware=True
+    )
+    nvlink_key = _factored_seed_cache_key(
+        8, Replicate(), config, mesh_shape, 2, fabric_aware=True
+    )
+    blind_rdma_key = _factored_seed_cache_key(
+        8, Replicate(), config, mesh_shape, 1, fabric_aware=False
+    )
+    blind_nvlink_key = _factored_seed_cache_key(
+        8, Replicate(), config, mesh_shape, 2, fabric_aware=False
+    )
+
+    assert rdma_key != nvlink_key
+    assert blind_rdma_key == blind_nvlink_key
+
+
+def test_factored_seed_cache_key_includes_input_placement():
+    config = h100_topo_config(num_nodes=64, gpus_per_node=8)
+    mesh_shape = (8, 8, 8)
+
+    shard_key = _factored_seed_cache_key(
+        8, Shard(0), config, mesh_shape, 0, fabric_aware=True
+    )
+    replicate_key = _factored_seed_cache_key(
+        8, Replicate(), config, mesh_shape, 0, fabric_aware=True
+    )
+
+    assert shard_key != replicate_key
