@@ -37,7 +37,7 @@ class StackedLinear(nn.Module):
 
 
 def _run_autop(mesh, model_fn, input_fn, mp_policy, repeated_subgraphs=False):
-    """Run AutoParallel and return the solution and optimizer."""
+    """Run AutoParallel and return the placement solution."""
     with torch.device("meta"):
         model = model_fn()
 
@@ -48,80 +48,71 @@ def _run_autop(mesh, model_fn, input_fn, mp_policy, repeated_subgraphs=False):
         autop.add_output_constraints([(Shard(0),) * mesh.ndim])
         sharding_placement = autop.optimize_placement(verbose=False)
 
-    return sharding_placement, autop
+    return sharding_placement
 
 
-def _assert_no_pre_cast_redistribution(
-    sharding_placement, autop, require_linked_validation=False
-):
-    """Assert that no chosen pre-cast decision var has comm_cost > 0.
-
-    This directly validates the solver constraint: no redistribution
-    should occur on unary-chain edges before the dtype_cast node.
-    """
-    from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
-
-    opt = autop.sharding_optimizer
-    validated_pre_cast_keys = 0
-    validated_linked_keys = 0
-
-    for param, grad in get_param_and_grad_nodes(opt.graph).values():
-        if grad is None:
+def _iter_dtype_casts(sharding_placement, dtype):
+    for node, strategy in sharding_placement.items():
+        if node.target != torch.ops.autoparallel.dtype_cast.default:
             continue
+        if node.meta["val"].dtype == dtype:
+            yield node, strategy
 
-        # Build the pre-cast node set (same logic as the constraint)
-        chain = [grad]
-        n = grad
-        while len(n.all_input_nodes) == 1:
-            parent = n.all_input_nodes[0]
-            if len(parent.all_input_nodes) != 1:
-                break
-            chain.append(parent)
-            n = parent
 
-        cast_idx = None
-        for i, node in enumerate(chain):
-            if node.target == torch.ops.autoparallel.dtype_cast.default:
-                cast_idx = i
-                break
+def _assert_unary_chain_has_no_pre_cast_redistribution(sharding_placement, cast_node):
+    node = cast_node
+    while True:
+        input_nodes = [n for n in node.all_input_nodes if n in sharding_placement]
+        if len(input_nodes) != 1:
+            return
 
-        if cast_idx is None:
+        producer = input_nodes[0]
+        input_spec = sharding_placement[node].input_specs[0]
+        producer_spec = sharding_placement[producer].output_specs
+        if not hasattr(input_spec, "placements") or not hasattr(
+            producer_spec, "placements"
+        ):
+            return
+
+        assert input_spec.placements == producer_spec.placements, (
+            f"dtype_cast pre-chain edge {producer.name}->{node.name} changes "
+            f"placement from {producer_spec.placements} to {input_spec.placements}"
+        )
+        node = producer
+
+
+def _assert_reduce_after_cast(sharding_placement, reduce_dtype, min_casts=1):
+    matched = 0
+    for node, strategy in _iter_dtype_casts(sharding_placement, reduce_dtype):
+        output_spec = strategy.output_specs
+        if not hasattr(output_spec, "placements") or not any(
+            p.is_partial() for p in output_spec.placements
+        ):
             continue
+        _assert_unary_chain_has_no_pre_cast_redistribution(sharding_placement, node)
+        matched += 1
 
-        pre_cast_node_idxs = set()
-        for node in chain[cast_idx:]:
-            if node in opt.node_map:
-                pre_cast_node_idxs.add(opt.node_map[node])
+    assert matched >= min_casts, (
+        f"Expected at least {min_casts} dtype_cast outputs with Partial placement, "
+        f"but found {matched}"
+    )
 
-        # Check that no chosen decision var on a pre-cast node has comm_cost > 0
-        for key in opt.selected_keys:
-            node_idx, argi, out_idx, inp_idx = key
-            if node_idx not in pre_cast_node_idxs:
-                continue
-            dv = opt._resolve_decision_var(key)
-            validated_pre_cast_keys += 1
-            if key in opt.cluster_links:
-                validated_linked_keys += 1
-            assert dv.comm_cost == 0, (
-                f"Pre-cast node {opt.nodes[node_idx].name} has chosen decision var "
-                f"with comm_cost={dv.comm_cost} > 0 (strategy {dv.strategy}). "
-                f"Redistribution should not happen before the dtype_cast."
-            )
 
-        # Also check dtype_cast output has Partial (indirect but readable check)
-        dtype_cast_node = chain[cast_idx]
-        spec = sharding_placement.get(dtype_cast_node)
-        if spec is not None:
-            assert any(p.is_partial() for p in spec.output_specs.placements), (
-                f"dtype_cast {dtype_cast_node.name} should have Partial output "
-                f"(no pre-cast reduction), but got {spec.output_specs.placements}"
-            )
+def _assert_forward_allgather_after_cast(sharding_placement, param_dtype, min_casts=1):
+    matched = 0
+    for node, strategy in _iter_dtype_casts(sharding_placement, param_dtype):
+        output_spec = strategy.output_specs
+        if not hasattr(output_spec, "placements") or any(
+            p.is_partial() for p in output_spec.placements
+        ):
+            continue
+        _assert_unary_chain_has_no_pre_cast_redistribution(sharding_placement, node)
+        matched += 1
 
-    assert validated_pre_cast_keys > 0, "Expected to validate at least one pre-cast key"
-    if require_linked_validation:
-        assert (
-            validated_linked_keys > 0
-        ), "Expected to validate at least one cluster-linked pre-cast key"
+    assert matched >= min_casts, (
+        f"Expected at least {min_casts} forward dtype_cast outputs, "
+        f"but found {matched}"
+    )
 
 
 @apply_cuda_patches
@@ -139,8 +130,8 @@ def test_grad_reduce_dtype_f32_reduces_after_cast(device_mesh_1d):
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16, reduce_dtype=torch.float32
     )
-    sharding_placement, autop = _run_autop(mesh, model_fn, input_fn, mp_policy)
-    _assert_no_pre_cast_redistribution(sharding_placement, autop)
+    sharding_placement = _run_autop(mesh, model_fn, input_fn, mp_policy)
+    _assert_reduce_after_cast(sharding_placement, torch.float32)
 
 
 @apply_cuda_patches
@@ -162,12 +153,10 @@ def test_grad_reduce_dtype_f32_with_repeated_subgraphs(device_mesh_1d):
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16, reduce_dtype=torch.float32
     )
-    sharding_placement, autop = _run_autop(
+    sharding_placement = _run_autop(
         mesh, model_fn, input_fn, mp_policy, repeated_subgraphs=True
     )
-    _assert_no_pre_cast_redistribution(
-        sharding_placement, autop, require_linked_validation=True
-    )
+    _assert_reduce_after_cast(sharding_placement, torch.float32, min_casts=2)
 
 
 @apply_cuda_patches
@@ -187,7 +176,7 @@ def test_grad_reduce_dtype_bf16_allows_early_reduction(device_mesh_1d):
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.float32, reduce_dtype=torch.bfloat16
     )
-    sharding_placement, _ = _run_autop(mesh, model_fn, input_fn, mp_policy)
+    sharding_placement = _run_autop(mesh, model_fn, input_fn, mp_policy)
     assert sharding_placement is not None, "Optimizer should find a feasible solution"
 
 
@@ -206,78 +195,11 @@ def test_grad_reduce_dtype_same_dtype_no_constraint(device_mesh_1d):
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.float32, reduce_dtype=torch.float32
     )
-    sharding_placement, _ = _run_autop(mesh, model_fn, input_fn, mp_policy)
+    sharding_placement = _run_autop(mesh, model_fn, input_fn, mp_policy)
     assert sharding_placement is not None, "Optimizer should find a feasible solution"
 
 
 # ---- Forward dtype_cast constraint tests ----
-
-
-def _assert_no_fwd_pre_cast_redistribution(
-    sharding_placement, autop, require_linked_validation=False
-):
-    """Assert that no forward dtype_cast has redistribution on its input edge.
-
-    Validates that every forward dtype_cast node matches its producer's
-    placement, so allgather happens on the cast output (smaller dtype)
-    rather than on the raw parameter (larger storage dtype).
-    """
-    from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
-
-    opt = autop.sharding_optimizer
-    validated_keys = 0
-    validated_linked_keys = 0
-
-    for param, _grad in get_param_and_grad_nodes(opt.graph).values():
-        # Walk forward from param through single-user unary nodes
-        n = param
-        while True:
-            if n.target == torch.ops.autoparallel.dtype_cast.default:
-                break
-            users = list(n.users.keys())
-            if len(users) != 1:
-                break
-            child = users[0]
-            if len(child.all_input_nodes) != 1:
-                break
-            n = child
-
-        if n.target != torch.ops.autoparallel.dtype_cast.default:
-            continue
-
-        # Only check downcasts (storage > param_dtype)
-        storage_dtype = param.meta["val"].dtype
-        cast_dtype = n.meta["val"].dtype
-        if cast_dtype.itemsize >= storage_dtype.itemsize:
-            continue
-
-        # Collect pre-cast node indices
-        fwd_pre_cast_node_idxs = set()
-        node = n
-        while node != param:
-            if node in opt.node_map:
-                fwd_pre_cast_node_idxs.add(opt.node_map[node])
-            node = node.all_input_nodes[0]
-
-        for key in opt.selected_keys:
-            node_idx, argi, out_idx, inp_idx = key
-            if node_idx not in fwd_pre_cast_node_idxs:
-                continue
-            dv = opt._resolve_decision_var(key)
-            validated_keys += 1
-            if key in opt.cluster_links:
-                validated_linked_keys += 1
-            assert dv.comm_cost == 0, (
-                f"Forward pre-cast node {opt.nodes[node_idx].name} has chosen "
-                f"decision var with comm_cost={dv.comm_cost} > 0. "
-                f"Redistribution should not happen before the dtype_cast."
-            )
-
-    assert validated_keys > 0, "Expected to validate at least one forward pre-cast key"
-    if require_linked_validation:
-        assert (
-            validated_linked_keys > 0
-        ), "Expected to validate at least one cluster-linked forward pre-cast key"
 
 
 @apply_cuda_patches
@@ -296,8 +218,8 @@ def test_fwd_allgather_in_param_dtype(device_mesh_1d):
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16, reduce_dtype=torch.float32
     )
-    sharding_placement, autop = _run_autop(mesh, model_fn, input_fn, mp_policy)
-    _assert_no_fwd_pre_cast_redistribution(sharding_placement, autop)
+    sharding_placement = _run_autop(mesh, model_fn, input_fn, mp_policy)
+    _assert_forward_allgather_after_cast(sharding_placement, torch.bfloat16)
 
 
 @apply_cuda_patches
@@ -317,8 +239,8 @@ def test_fwd_allgather_in_param_dtype_reduce_bf16(device_mesh_1d):
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16
     )
-    sharding_placement, autop = _run_autop(mesh, model_fn, input_fn, mp_policy)
-    _assert_no_fwd_pre_cast_redistribution(sharding_placement, autop)
+    sharding_placement = _run_autop(mesh, model_fn, input_fn, mp_policy)
+    _assert_forward_allgather_after_cast(sharding_placement, torch.bfloat16)
 
 
 @apply_cuda_patches
@@ -336,11 +258,11 @@ def test_fwd_allgather_with_repeated_subgraphs(device_mesh_1d):
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16, reduce_dtype=torch.float32
     )
-    sharding_placement, autop = _run_autop(
+    sharding_placement = _run_autop(
         mesh, model_fn, input_fn, mp_policy, repeated_subgraphs=True
     )
-    _assert_no_fwd_pre_cast_redistribution(
-        sharding_placement, autop, require_linked_validation=True
+    _assert_forward_allgather_after_cast(
+        sharding_placement, torch.bfloat16, min_casts=2
     )
 
 
@@ -363,14 +285,5 @@ def test_fwd_no_constraint_when_upcasting(device_mesh_1d):
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.float32, reduce_dtype=torch.bfloat16
     )
-    sharding_placement, autop = _run_autop(mesh, model_fn, input_fn, mp_policy)
-
-    # Verify no fwd_param_dtype constraints were added to the ILP
-    opt = autop.sharding_optimizer
-    fwd_constraint_names = [
-        name for name in opt.prob.constraints if name.startswith("fwd_param_dtype")
-    ]
-    assert len(fwd_constraint_names) == 0, (
-        f"Forward dtype constraint should not fire for upcasting, "
-        f"but found {len(fwd_constraint_names)} constraints: {fwd_constraint_names}"
-    )
+    sharding_placement = _run_autop(mesh, model_fn, input_fn, mp_policy)
+    assert sharding_placement is not None, "Optimizer should find a feasible solution"

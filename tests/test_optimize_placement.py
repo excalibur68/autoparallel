@@ -63,6 +63,19 @@ class TransformerBlock(nn.Module):
         return o
 
 
+class StackedLinear(nn.Module):
+    def __init__(self, dim, n_layers):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [nn.Linear(dim, dim, bias=False) for _ in range(n_layers)]
+        )
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x).relu()
+        return x
+
+
 def _make_model_and_input_fn(
     mesh, model_type="ffn_with_multiple_input_output", device="cuda"
 ):
@@ -90,6 +103,38 @@ def _make_model_and_input_fn(
             return torch.randn(bs, 256, dim1, device=device, requires_grad=True)
 
     return model_fn, input_fn
+
+
+def _placement_signature(solution):
+    def output_signature(output_specs):
+        if isinstance(output_specs, (tuple, list)):
+            return tuple(
+                None if spec is None else tuple(str(p) for p in spec.placements)
+                for spec in output_specs
+            )
+        return tuple(str(p) for p in output_specs.placements)
+
+    return {
+        node.name: output_signature(strategy.output_specs)
+        for node, strategy in solution.items()
+    }
+
+
+def _solve_stacked_linear(device_mesh, n_layers):
+    batch_size = 2 * device_mesh.shape[0]
+    dim = 16
+
+    with torch.device("meta"):
+        model = StackedLinear(dim, n_layers)
+
+    def input_fn():
+        return torch.randn(batch_size, dim, device="cuda")
+
+    with AutoParallel(model, input_fn, device_mesh, repeated_subgraphs=False) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        autop.add_parameter_memory_constraint(low=None, high=None)
+        return _placement_signature(autop.optimize_placement())
 
 
 @apply_cuda_patches
@@ -181,6 +226,19 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
         assert p.input_specs[0].placements == (Shard(0),)
         assert p.output_specs.placements == (Shard(0),)
         assert p.input_specs[1].placements == (Replicate(),)
+
+
+@apply_cuda_patches
+def test_fast_build_preserves_optimizer_solution(device_mesh_1d, monkeypatch):
+    monkeypatch.setenv("AP_FAST_BUILD", "0")
+    monkeypatch.setenv("AP_PARALLEL_BUILD", "1")
+    baseline = _solve_stacked_linear(device_mesh_1d, n_layers=8)
+
+    monkeypatch.setenv("AP_FAST_BUILD", "1")
+    monkeypatch.setenv("AP_PARALLEL_BUILD", "2")
+    fast = _solve_stacked_linear(device_mesh_1d, n_layers=8)
+
+    assert fast == baseline
 
 
 _expected_param_placements_ffn = [(Shard(0), Shard(0)), (Shard(0), Shard(1))]
