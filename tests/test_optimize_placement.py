@@ -13,7 +13,11 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from autoparallel.api import AutoParallel, auto_parallel
-from autoparallel.collectives import local_map
+from autoparallel.collectives import (
+    flex_local_map,
+    get_flex_local_map_alternatives,
+    local_map,
+)
 
 
 class FFN(nn.Module):
@@ -465,6 +469,133 @@ def test_local_map_placement_respected(device_mesh_2d, device="cuda"):
     grad_q_spec, grad_k_spec, grad_v_spec = bw_spec.output_specs
     assert grad_q_spec.placements == (Shard(dim=0), Shard(dim=2))
     assert grad_k_spec.placements == grad_v_spec.placements == (Shard(0), Replicate())
+
+
+def _flex_attention_body(query, key, value):
+    out = F.scaled_dot_product_attention(
+        query=query, key=key, value=value, is_causal=False
+    )
+    return (out,)
+
+
+class FlexLocalMapTransformerBlock(nn.Module):
+    def __init__(self, nheads, dim1, dim2, mesh):
+        super().__init__()
+        self.nheads = nheads
+        bias = False
+        self.wq = nn.Linear(dim1, dim1, bias=bias)
+        self.wk = nn.Linear(dim1, dim1, bias=bias)
+        self.wv = nn.Linear(dim1, dim1, bias=bias)
+        self.wo = nn.Linear(dim1, dim1, bias=bias)
+        self.w1 = nn.Linear(dim1, dim2, bias=bias)
+        self.w2 = nn.Linear(dim2, dim1, bias=bias)
+        # flex_local_map must be built OUTSIDE forward so its out_placements carrier
+        # is a Dynamo Source at trace time (an in-forward-constructed tuple subclass
+        # traces as an empty value); this needs an explicit device_mesh.
+        self.attention = flex_local_map(
+            _flex_attention_body,
+            alternatives=[
+                {
+                    "name": "sequence_parallel",
+                    "in_placements": (
+                        (Shard(0), Shard(2)),
+                        (Shard(0), Replicate()),
+                        (Shard(0), Replicate()),
+                    ),
+                    "out_placements": ((Shard(0), Shard(2)),),
+                    "cost_hint": 0.0,
+                },
+                {
+                    "name": "replicated_boundary",
+                    "in_placements": (
+                        (Shard(0), Replicate()),
+                        (Shard(0), Replicate()),
+                        (Shard(0), Replicate()),
+                    ),
+                    "out_placements": ((Shard(0), Replicate()),),
+                    "cost_hint": 0.0,
+                },
+            ],
+            redistribute_inputs=True,
+            device_mesh=mesh,
+        )
+
+    def forward(self, x):
+        q = self.wq(x)
+        k = self.wk(x)
+        v = self.wv(x)
+
+        q = q.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
+        k = k.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
+        v = v.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
+
+        o = self.attention(q, k, v)[0]
+        o = o.permute(0, 2, 1, 3).flatten(-2)
+
+        o = self.wo(o)
+        o0 = o + x
+        o = self.w2(torch.nn.functional.relu(self.w1(o0)))
+        return o0 + o
+
+
+@apply_cuda_patches
+def test_flex_local_map_alternatives_visible_to_solver(device_mesh_2d, device="cuda"):
+    # Validates the graph AutoParallel hands to the solver, not e2e execution:
+    # flex_local_map with 2 alternatives must trace (surviving the model deepcopy
+    # in AutoParallel.__init__), expose both alternatives on the forward local_map
+    # node, produce one solver strategy per alternative, and let the solver pick one.
+    bs = 8 * device_mesh_2d.shape[0]
+    dim1 = 6144
+    dim2 = dim1 * 4
+    nheads = 48
+    seq_len = 256
+
+    def input_fn():
+        return torch.randn(bs, seq_len, dim1, device=device, requires_grad=True)
+
+    with torch.device("meta"):
+        model = FlexLocalMapTransformerBlock(nheads, dim1, dim2, mesh=device_mesh_2d)
+
+    # Entering the context deep-copies and traces the model; before the
+    # _FlexLocalMapOutPlacements.__getnewargs__ fix this raised in copy.deepcopy.
+    with AutoParallel(model, input_fn, device_mesh_2d) as autop:
+        autop.add_parameter_memory_constraint(low=None, high=None)
+        x_sharding = (Shard(0), Shard(1))
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+
+        local_map_nodes = [
+            n for n in autop.gm.graph.nodes if "local_map_kwargs" in n.meta
+        ]
+        assert len(local_map_nodes) == 2, "Expected a fw and bw local_map node"
+
+        # The alternatives survive Dynamo + AOTAutograd on the forward node.
+        fw_node = next(n for n in local_map_nodes if "backward" not in str(n.target))
+        alternatives = get_flex_local_map_alternatives(fw_node.meta["local_map_kwargs"])
+        assert alternatives is not None
+        assert len(alternatives) == 2
+
+        # The solver sees one strategy per alternative, with the declared placements.
+        opt = autop.sharding_optimizer
+        flex_nodes = [
+            n
+            for n in opt.strats
+            if get_flex_local_map_alternatives(n.meta.get("local_map_kwargs", {}))
+            is not None
+        ]
+        assert len(flex_nodes) == 1
+        strategies = opt.strats[flex_nodes[0]].strategies
+        assert len(strategies) == 2
+        assert {s.output_specs[0].placements for s in strategies} == {
+            (Shard(0), Shard(2)),
+            (Shard(0), Replicate()),
+        }
+
+        sharding_placement = autop.optimize_placement()
+
+    # The solver produced a feasible solution that selected one of the alternatives.
+    chosen = sharding_placement[fw_node].output_specs[0].placements
+    assert chosen in ((Shard(0), Shard(2)), (Shard(0), Replicate()))
 
 
 @apply_cuda_patches

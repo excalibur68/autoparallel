@@ -91,6 +91,7 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_map_only
 
+from .collectives import get_flex_local_map_alternatives
 from .cost_models.collective_runtime_estimation import estimate_strategy_comms_cost
 from .cost_models.compute_estimation import (
     _get_sharded_shape_stride,
@@ -146,6 +147,15 @@ def concretize_args(args):
         return x
 
     return tree_map_only((torch.SymInt, FakeTensor), concretize, args)
+
+
+def _get_flex_local_map_cost_hint(node, out_idx):
+    alternatives = get_flex_local_map_alternatives(
+        node.meta.get("local_map_kwargs", {})
+    )
+    if alternatives is None:
+        return 0.0
+    return float(alternatives[out_idx].get("cost_hint", 0.0))
 
 
 def _produces_tensor(val):
@@ -511,6 +521,7 @@ class ShardingOptimizer:
             for out_idx, output_strategy in enumerate(op_strategy.strategies):
                 tc0 = time.perf_counter()
                 compute_cost = estimate_strategy_runtime_cost(node, output_strategy)
+                compute_cost += _get_flex_local_map_cost_hint(node, out_idx)
                 tc1 = time.perf_counter()
                 t_compute += tc1 - tc0
                 per_arg_compute = compute_cost / num_args

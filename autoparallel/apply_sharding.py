@@ -25,6 +25,7 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
 
+from .collectives import get_flex_local_map_alternatives
 from .graph_passes.graph_utils import all_input_nodes, cleanup_graph
 from .shardings.ordered_sharding import (
     compute_optimal_placement_order_for_parameters,
@@ -277,6 +278,36 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
         return new_args, last_tgt_spec
 
+    def _call_flex_local_map_alternative(self, target, new_args, kwargs):
+        node = self._curr_node
+        alternatives = get_flex_local_map_alternatives(
+            node.meta.get("local_map_kwargs", {})
+        )
+        assert alternatives is not None
+
+        strategy = self.sharding_placement[node]
+        alternative_index = getattr(strategy, "flex_local_map_alternative_index", None)
+        if alternative_index is None:
+            raise AssertionError(
+                f"{node.name} has flex local_map alternatives but no selected index"
+            )
+
+        if alternative_index == 0:
+            return super().call_function(target, tuple(new_args), kwargs)
+
+        alternative = alternatives[alternative_index]
+        fn = alternative.get("fn")
+        if fn is None:
+            raise AssertionError(
+                f"{node.name} selected flex local_map alternative "
+                f"{alternative_index} without a function body"
+            )
+
+        call_args = tuple(new_args)
+        if call_args and isinstance(call_args[0], torch.fx.GraphModule):
+            call_args = call_args[1:]
+        return fn(*call_args, **kwargs)
+
     def call_function(self, target, args, kwargs):
         if self._curr_node not in self.sharding_placement:
             # Shape-computation nodes (sym_size, operator.mul, etc.) produce
@@ -288,7 +319,15 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         else:
             new_args, tgt_spec = self._redistribute_and_adjust_args(target, args)
 
-        out = super().call_function(target, tuple(new_args), kwargs)
+        if (
+            get_flex_local_map_alternatives(
+                self._curr_node.meta.get("local_map_kwargs", {})
+            )
+            is not None
+        ):
+            out = self._call_flex_local_map_alternative(target, new_args, kwargs)
+        else:
+            out = super().call_function(target, tuple(new_args), kwargs)
         out = tree_map_only(DTensor, lambda x: x.to_local(), out)
         return out
 

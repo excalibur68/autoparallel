@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
+from collections.abc import Callable, Sequence
 from typing import Any, Optional, Tuple
 
 import torch
@@ -11,6 +13,121 @@ from torch.distributed._tensor.experimental import local_map as _local_map
 from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
 from torch.distributed.distributed_c10d import GroupName
 from torch.distributed.tensor.placement_types import Placement
+
+_FLEX_LOCAL_MAP_ALTERNATIVES_ATTR = "_autoparallel_flex_local_map_alternatives"
+
+
+# Dynamo's local_map HOP only preserves placement kwargs in FX metadata.
+# Carry flex metadata on out_placements so slicing in the HOP wrapper keeps it.
+class _FlexLocalMapOutPlacements(tuple):
+    def __new__(cls, values, alternatives):
+        obj = super().__new__(cls, values)
+        setattr(obj, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR, alternatives)
+        return obj
+
+    def __getnewargs__(self):
+        # AutoParallel deep-copies the user model (api.py), which reconstructs
+        # this tuple subclass via copyreg.__newobj__ -> __new__(cls, *args).
+        # The two-arg __new__ requires we surface `alternatives` here too.
+        return (tuple(self), getattr(self, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR))
+
+    def __getitem__(self, item):
+        result = super().__getitem__(item)
+        if isinstance(item, slice):
+            return type(self)(result, getattr(self, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR))
+        return result
+
+
+def get_flex_local_map_alternatives(local_map_kwargs):
+    alternatives = local_map_kwargs.get("alternatives")
+    if alternatives is not None:
+        return alternatives
+
+    for key in ("out_placements", "in_placements"):
+        placements = local_map_kwargs.get(key)
+        alternatives = getattr(placements, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR, None)
+        if alternatives is not None:
+            return alternatives
+
+    return None
+
+
+def _normalize_flex_local_map_alternatives(
+    default_fn: Callable,
+    alternatives: Sequence[dict[str, Any]],
+):
+    assert len(alternatives) > 0, "flex_local_map requires at least one alternative"
+
+    normalized = []
+    for idx, alternative in enumerate(alternatives):
+        fn = alternative.get("fn", default_fn)
+        assert fn is not None, "flex_local_map alternative fn must not be None"
+        assert "in_placements" in alternative
+        assert "out_placements" in alternative
+        normalized.append(
+            {
+                **alternative,
+                "fn": fn,
+                "cost_hint": float(alternative.get("cost_hint", 0.0)),
+                "name": alternative.get("name", getattr(fn, "__name__", f"alt_{idx}")),
+            }
+        )
+
+    return tuple(normalized)
+
+
+def flex_local_map(
+    func: Callable | None = None,
+    *,
+    alternatives: Sequence[dict[str, Any]],
+    in_grad_placements=None,
+    device_mesh: Optional[DeviceMesh] = None,
+    redistribute_inputs: bool = False,
+):
+    """Expose several placement contracts for one ``local_map`` region so the
+    AutoParallel solver can choose among them (e.g. MoE DP->EP vs DP+TP->EP+ETP).
+
+    ``alternatives`` is a list of dicts, each with required ``in_placements`` and
+    ``out_placements`` and optional ``fn`` (defaults to ``func``), ``name``, and
+    ``cost_hint`` (folded into the solver's compute cost, default 0.0). The
+    alternatives must be *semantically equivalent* (same result); they only differ in
+    boundary sharding (and possibly local body). The first alternative is the one that
+    is actually traced and is the default body.
+
+    IMPORTANT: apply ``flex_local_map`` OUTSIDE ``forward`` (e.g. in ``__init__`` or
+    module scope) and pass an explicit ``device_mesh``; store the returned callable and
+    invoke it in ``forward``. The alternatives ride on a tuple-subclass carrier that
+    Dynamo only preserves when it is a pre-existing (sourced) object — constructing the
+    wrapper inside ``forward`` traces it as empty and fails.
+
+    This wires one solver strategy per alternative into the traced graph; selecting and
+    running a non-default alternative end-to-end (backward-consistent apply) is not yet
+    complete.
+    """
+    if func is None:
+        return functools.partial(
+            flex_local_map,
+            alternatives=alternatives,
+            in_grad_placements=in_grad_placements,
+            device_mesh=device_mesh,
+            redistribute_inputs=redistribute_inputs,
+        )
+
+    normalized_alternatives = _normalize_flex_local_map_alternatives(func, alternatives)
+    default_alternative = normalized_alternatives[0]
+    out_placements = _FlexLocalMapOutPlacements(
+        tuple(default_alternative["out_placements"]),
+        normalized_alternatives,
+    )
+
+    return local_map(
+        default_alternative["fn"],
+        out_placements=out_placements,
+        in_placements=default_alternative["in_placements"],
+        in_grad_placements=in_grad_placements,
+        device_mesh=device_mesh,
+        redistribute_inputs=redistribute_inputs,
+    )
 
 
 def with_sharding_constraint(
