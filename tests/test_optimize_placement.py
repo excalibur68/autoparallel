@@ -575,7 +575,8 @@ def test_flex_local_map_alternatives_visible_to_solver(device_mesh_2d, device="c
         assert alternatives is not None
         assert len(alternatives) == 2
 
-        # The solver sees one strategy per alternative, with the declared placements.
+        # Both the forward and (after normalize_flex_local_map_backward) the backward
+        # local_map node are alternative-aware; the forward has a single declared output.
         opt = autop.sharding_optimizer
         flex_nodes = [
             n
@@ -583,8 +584,13 @@ def test_flex_local_map_alternatives_visible_to_solver(device_mesh_2d, device="c
             if get_flex_local_map_alternatives(n.meta.get("local_map_kwargs", {}))
             is not None
         ]
-        assert len(flex_nodes) == 1
-        strategies = opt.strats[flex_nodes[0]].strategies
+        assert len(flex_nodes) == 2
+        fw_flex = next(
+            n
+            for n in flex_nodes
+            if len(n.meta["local_map_kwargs"]["out_placements"]) == 1
+        )
+        strategies = opt.strats[fw_flex].strategies
         assert len(strategies) == 2
         assert {s.output_specs[0].placements for s in strategies} == {
             (Shard(0), Shard(2)),
@@ -596,6 +602,71 @@ def test_flex_local_map_alternatives_visible_to_solver(device_mesh_2d, device="c
     # The solver produced a feasible solution that selected one of the alternatives.
     chosen = sharding_placement[fw_node].output_specs[0].placements
     assert chosen in ((Shard(0), Shard(2)), (Shard(0), Replicate()))
+
+
+def _flex_fw_bw_nodes(nodes):
+    """Return (forward, backward) flex local_map nodes. The forward node has a single
+    declared output; the backward node's outputs are the (mirrored) input grads."""
+    flex = [
+        n
+        for n in nodes
+        if get_flex_local_map_alternatives(n.meta.get("local_map_kwargs", {}))
+        is not None
+    ]
+    assert len(flex) == 2, f"expected fw+bw flex local_map nodes, got {len(flex)}"
+    fw = next(n for n in flex if len(n.meta["local_map_kwargs"]["out_placements"]) == 1)
+    bw = next(n for n in flex if n is not fw)
+    return fw, bw
+
+
+@apply_cuda_patches
+def test_flex_local_map_backward_is_alternative_aware(device_mesh_2d, device="cuda"):
+    # normalize_flex_local_map_backward makes the backward local_map node
+    # alternative-aware: one solver strategy per alternative, mirrored (its grad outputs
+    # take the forward's input placements), and the solver places the forward and
+    # backward on the same alternative.
+    bs = 8 * device_mesh_2d.shape[0]
+    dim1 = 6144
+    dim2 = dim1 * 4
+    nheads = 48
+    seq_len = 256
+
+    def input_fn():
+        return torch.randn(bs, seq_len, dim1, device=device, requires_grad=True)
+
+    with torch.device("meta"):
+        model = FlexLocalMapTransformerBlock(nheads, dim1, dim2, mesh=device_mesh_2d)
+
+    with AutoParallel(model, input_fn, device_mesh_2d) as autop:
+        autop.add_parameter_memory_constraint(low=None, high=None)
+        x_sharding = (Shard(0), Shard(1))
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+
+        # Backward node has one strategy per alternative, mirrored: its first grad output
+        # takes the forward's first input placement per alternative.
+        opt = autop.sharding_optimizer
+        _, bw_concrete = _flex_fw_bw_nodes(list(opt.strats))
+        bw_strats = opt.strats[bw_concrete].strategies
+        assert len(bw_strats) == 2
+        assert {s.output_specs[0].placements for s in bw_strats} == {
+            (Shard(0), Shard(2)),
+            (Shard(0), Replicate()),
+        }
+
+        sharding_placement = autop.optimize_placement()
+
+    # Forward and backward are placed on the same alternative (no linking constraint
+    # needed — the solver selects them consistently).
+    fw_node, bw_node = _flex_fw_bw_nodes(list(autop.gm.graph.nodes))
+    fw_idx = getattr(
+        sharding_placement[fw_node], "flex_local_map_alternative_index", None
+    )
+    bw_idx = getattr(
+        sharding_placement[bw_node], "flex_local_map_alternative_index", None
+    )
+    assert fw_idx is not None
+    assert fw_idx == bw_idx
 
 
 @apply_cuda_patches

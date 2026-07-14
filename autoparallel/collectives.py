@@ -52,6 +52,94 @@ def get_flex_local_map_alternatives(local_map_kwargs):
     return None
 
 
+def _placements_key(placements):
+    return tuple(tuple(str(p) for p in row) for row in placements)
+
+
+def _mirror_flex_alternative(alternative):
+    # A local_map's backward mirrors its forward contract: the backward's tangent
+    # inputs take the forward's output placements, and it produces input-grads at the
+    # forward's input placements (this is what torch's create_hop_fw_bw does for the
+    # default alternative). So swap in/out to get the backward contract per alternative.
+    return {
+        **alternative,
+        "in_placements": alternative["out_placements"],
+        "out_placements": alternative["in_placements"],
+    }
+
+
+def _flex_body_is_backward(gm, node):
+    body = node.args[0]
+    if isinstance(body, torch.fx.Node) and body.op == "get_attr":
+        obj = gm
+        for part in body.target.split("."):
+            obj = getattr(obj, part)
+        return bool(getattr(obj, "meta", {}).get("is_backward", False))
+    return False
+
+
+def _find_flex_backward_node(gm, fw_node):
+    """The backward local_map node is the one consuming the fw node's saved-activation
+    getitems (see create_hop_fw_bw)."""
+    for node in gm.graph.nodes:
+        if node is fw_node or "local_map_kwargs" not in node.meta:
+            continue
+        if not _flex_body_is_backward(gm, node):
+            continue
+        for inp in node.all_input_nodes:
+            if (
+                inp.op == "call_function"
+                and getattr(inp.target, "__name__", "") == "getitem"
+                and inp.args[0] is fw_node
+            ):
+                return node
+    return None
+
+
+def normalize_flex_local_map_backward(gm):
+    """Make the backward ``local_map`` node alternative-aware.
+
+    ``flex_local_map`` only traces the default alternative, so torch's fw/bw split leaves
+    the backward node with a single (default) contract and no alternatives carrier. For
+    each forward flex node, pair it with its backward node and attach the per-alternative
+    contracts mirrored (in<->out), so AutoParallel emits one solver strategy per
+    alternative on the backward side too.
+    """
+    for node in list(gm.graph.nodes):
+        local_map_kwargs = node.meta.get("local_map_kwargs")
+        if not local_map_kwargs:
+            continue
+        alternatives = get_flex_local_map_alternatives(local_map_kwargs)
+        if alternatives is None:
+            continue  # only the forward flex node carries the alternatives
+        # Pin the alternatives on a stable dict key (robust past the tuple carrier).
+        local_map_kwargs["alternatives"] = tuple(alternatives)
+
+        bw_node = _find_flex_backward_node(gm, node)
+        if bw_node is None:
+            continue  # inference-only region (no backward node)
+
+        bw_kwargs = bw_node.meta["local_map_kwargs"]
+        mirrored = tuple(_mirror_flex_alternative(a) for a in alternatives)
+        # Validate the mirror against torch's own default-alternative bw placements;
+        # if it doesn't match (e.g. not all declared outputs are differentiable), fail
+        # loudly rather than emitting wrong backward strategies.
+        if _placements_key(mirrored[0]["in_placements"]) != _placements_key(
+            bw_kwargs["in_placements"]
+        ) or _placements_key(mirrored[0]["out_placements"]) != _placements_key(
+            bw_kwargs["out_placements"]
+        ):
+            raise NotImplementedError(
+                "flex_local_map: cannot mirror alternatives onto the backward node "
+                f"{bw_node.name}; expected mirror(default)="
+                f"(in={_placements_key(mirrored[0]['in_placements'])}, "
+                f"out={_placements_key(mirrored[0]['out_placements'])}) to match torch's "
+                f"backward placements (in={_placements_key(bw_kwargs['in_placements'])}, "
+                f"out={_placements_key(bw_kwargs['out_placements'])})."
+            )
+        bw_kwargs["alternatives"] = mirrored
+
+
 def _normalize_flex_local_map_alternatives(
     default_fn: Callable,
     alternatives: Sequence[dict[str, Any]],

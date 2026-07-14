@@ -28,6 +28,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
+from .collectives import normalize_flex_local_map_backward
 from .graph_passes.activation_checkpointing import mark_fsdp_all_gather_recomputation
 from .graph_passes.graph_utils import (
     _add_alias,
@@ -209,6 +210,9 @@ def build_joint_graph(
     # now add aliases nodes to the graph to
     # give more room for optimizations
     _add_alias(gm, version="v2")
+    # Make backward local_map nodes alternative-aware (flex_local_map only traces the
+    # default alternative, so torch's fw/bw split drops the alternatives from the bw node).
+    normalize_flex_local_map_backward(gm)
     trace_structured(
         "artifact",
         metadata_fn=lambda: {
