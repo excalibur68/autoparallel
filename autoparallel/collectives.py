@@ -97,14 +97,9 @@ def _find_flex_backward_node(gm, fw_node):
 
 
 def normalize_flex_local_map_backward(gm):
-    """Make the backward ``local_map`` node alternative-aware.
-
-    ``flex_local_map`` only traces the default alternative, so torch's fw/bw split leaves
-    the backward node with a single (default) contract and no alternatives carrier. For
-    each forward flex node, pair it with its backward node and attach the per-alternative
-    contracts mirrored (in<->out), so AutoParallel emits one solver strategy per
-    alternative on the backward side too.
-    """
+    """Attach each flex region's alternatives (mirrored in<->out) to its backward
+    ``local_map`` node, so the solver gets one strategy per alternative on the backward
+    side too."""
     for node in list(gm.graph.nodes):
         local_map_kwargs = node.meta.get("local_map_kwargs")
         if not local_map_kwargs:
@@ -172,25 +167,16 @@ def flex_local_map(
     device_mesh: Optional[DeviceMesh] = None,
     redistribute_inputs: bool = False,
 ):
-    """Expose several placement contracts for one ``local_map`` region so the
-    AutoParallel solver can choose among them (e.g. MoE DP->EP vs DP+TP->EP+ETP).
+    """Like ``local_map``, but declares several placement alternatives for one region so
+    the AutoParallel solver can choose among them (e.g. MoE DP->EP vs DP+TP->EP+ETP).
 
-    ``alternatives`` is a list of dicts, each with required ``in_placements`` and
-    ``out_placements`` and optional ``fn`` (defaults to ``func``), ``name``, and
-    ``cost_hint`` (folded into the solver's compute cost, default 0.0). The
-    alternatives must be *semantically equivalent* (same result); they only differ in
-    boundary sharding (and possibly local body). The first alternative is the one that
-    is actually traced and is the default body.
+    Each entry of ``alternatives`` is a dict with ``in_placements`` and ``out_placements``
+    (required) and optional ``fn`` (defaults to ``func``), ``name``, and ``cost_hint`` (a
+    solver cost hint, default 0.0). ``in_grad_placements``, ``device_mesh`` and
+    ``redistribute_inputs`` are as in ``local_map``.
 
-    IMPORTANT: apply ``flex_local_map`` OUTSIDE ``forward`` (e.g. in ``__init__`` or
-    module scope) and pass an explicit ``device_mesh``; store the returned callable and
-    invoke it in ``forward``. The alternatives ride on a tuple-subclass carrier that
-    Dynamo only preserves when it is a pre-existing (sourced) object — constructing the
-    wrapper inside ``forward`` traces it as empty and fails.
-
-    This wires one solver strategy per alternative into the traced graph; selecting and
-    running a non-default alternative end-to-end (backward-consistent apply) is not yet
-    complete.
+    Apply it outside ``forward`` (e.g. in ``__init__``) with an explicit ``device_mesh``,
+    and call the returned callable inside ``forward``.
     """
     if func is None:
         return functools.partial(
