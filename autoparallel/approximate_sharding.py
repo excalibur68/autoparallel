@@ -3,35 +3,13 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""
-Approximate sharding solver.
+"""Approximate sharding solver.
 
-The ILP in :mod:`optimize_sharding` selects, for every operation, an output
-placement and (per argument) the input placement of its producer. The flow
-constraint forces a consumer's input placement to equal its producer's chosen
-output placement, so the only genuinely free variables are the per-node output
-strategy indices ``x_v``. The problem therefore reduces to a pairwise discrete
-energy minimization over a DAG::
-
-    E(x) = Σ_v U_v(x_v) + Σ_{(u,v)} B_{uv}(x_u, x_v)
-
-where ``U_v`` is the compute cost and ``B_{uv}`` is the communication +
-sharding-transition cost on the edge from producer ``u`` to consumer ``v``.
-
-This is a pairwise MRF. The autograd DAG has small in-degree (<3) but large
-out-degree (tens) and a wide topological frontier (hundreds), so exact
-frontier/junction-tree DP blows up. We instead solve it with **min-sum belief
-propagation** (max-product in min-sum form) on the graph of *coupled groups*,
-which propagates coordinated decisions globally, then polish with group-level
-coordinate descent and a star-block local search.
-
-Nodes that must be chosen jointly are merged into groups: repeated-subgraph
-cluster copies share a strategy index, and forward/backward pairs share an
-output placement. The solver reuses the strategies, decision variables and
-constraints already built by ``ShardingOptimizer`` (it replaces only the
-CBC/ILP *solve*, not problem construction) and writes its assignment back into
-the PuLP variables, so the result is scored with the exact same objective as the
-ILP (``pulp.value(prob.objective)``).
+Reduces the sharding ILP (see :mod:`optimize_sharding`) to a pairwise MRF over the
+per-node output-strategy indices and solves it with tree-reweighted message passing
+(TRW-S) plus local-search polish, replacing only the CBC/ILP *solve*. It reuses the
+strategies / decision variables / constraints built by ``ShardingOptimizer`` and writes
+its assignment back into the PuLP variables, so it is scored by ``pulp.value(prob.objective)``.
 """
 
 import logging
@@ -43,7 +21,6 @@ from typing import Any, Optional
 
 import numpy as np
 import pulp
-import torch
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
@@ -53,14 +30,6 @@ logger = logging.getLogger(__name__)
 
 INF = float("inf")
 BIG = 1e12  # finite stand-in for forbidden combinations (avoids NaN in min-sum)
-
-# Paired forward/backward constraints couple two nodes to the *same output
-# placement* (the strategy index may differ between the two strategy lists).
-_PAIRED_PREFIXES = (
-    "grad_param_constraint",
-    "grad_input_constraint",
-    "grad_output_constraint",
-)
 
 
 @dataclass
@@ -122,7 +91,6 @@ class ApproximateShardingSolver:
         optimizer,
         candidate_limit: Optional[int] = 64,
         bp_iters: int = 400,
-        bp_tol: float = 1e-3,
         max_sweeps: int = 12,
         max_time_s: float = 60.0,
         star_passes: int = 2,
@@ -132,7 +100,6 @@ class ApproximateShardingSolver:
         self.opt = optimizer
         self.candidate_limit = candidate_limit
         self.bp_iters = bp_iters
-        self.bp_tol = bp_tol
         self.max_sweeps = max_sweeps
         self.max_time_s = max_time_s
         self.star_passes = star_passes
@@ -148,7 +115,6 @@ class ApproximateShardingSolver:
         self.node_to_group: dict[int, int] = {}
         self.input_edges: dict[int, list[tuple[int, int]]] = {}
         self._arg_prod: dict[int, dict[int, int]] = {}
-        self.consumers: dict[int, list[tuple[int, int]]] = defaultdict(list)
         self.cur_out: dict[int, int] = {}
         self._memory: Optional[dict[str, Any]] = None
         # When False, the hard memory-budget checks in local search are skipped
@@ -192,17 +158,13 @@ class ApproximateShardingSolver:
             )
 
         deadline = t0 + self.max_time_s
-        # TRW-S init, then local-search polish. TRW-S reaches the exact MAP on the
-        # (integral) sharding problem, so the old greedy second candidate it used
-        # to be compared against is strictly dominated and has been dropped; the
-        # polish remains for the memory budget and as a local-search safety net.
+        # TRW-S reaches the exact MAP on this integral problem; the polish below
+        # is for the memory budget and as a local-search safety net.
         t_bp0 = time.perf_counter()
         mem = self._memory
         if mem is not None and not mem.get("tight"):
-            # A non-tight budget can bind the runtime-optimal placement; solve it
-            # exactly via Lagrangian relaxation (folds λ·ratio into the unaries).
-            # A tight budget is already handled by build-time param pinning, and
-            # the no-memory case has nothing to relax, so both take the plain path.
+            # Non-tight budget: solve exactly via Lagrangian relaxation. Tight
+            # budgets use build-time pinning; the no-budget case has nothing to relax.
             res = self.solve_lagrangian(
                 mem["budget_low"],
                 mem["budget_high"],
@@ -261,15 +223,7 @@ class ApproximateShardingSolver:
             t_solve,
             total_s,
         )
-        opt.profile["approximate"] = {
-            "objective": objective,
-            "status": status,
-            "build_s": t_build,
-            "solve_s": t_solve,
-            "total_s": total_s,
-            "groups": len(self.groups),
-            "bp_energy": bp_energy,
-        }
+        opt.profile["approximate"] = {"objective": objective}
         if infeasible:
             raise RuntimeError(
                 "ApproximateShardingSolver could not find a feasible assignment. "
@@ -324,12 +278,9 @@ class ApproximateShardingSolver:
             if len(producers) > 1:
                 flow_couplings.append(producers)
         self.input_edges = {}
-        self.consumers = defaultdict(list)
         for v in self.cost_bearing:
             edges = sorted(self._arg_prod.get(v, {}).items())
             self.input_edges[v] = edges
-            for argi, p in edges:
-                self.consumers[p].append((v, argi))
         t_parse = time.perf_counter()
 
         # Remove fully-forbidden out_idx for cost-bearing nodes.
@@ -388,61 +339,15 @@ class ApproximateShardingSolver:
             if not math.isfinite(dv.cost) or dv.cost == 10000.0:
                 self.forbidden.add(key)
 
-        # 2a. forward param-dtype forbidden (== add_grad_reduce_dtype_constraints
-        #     forward part, unconditional). Force the FSDP allgather to run after
-        #     a downcasting param dtype_cast (in the smaller param_dtype) by
-        #     forbidding any pre-cast redistribution.
-        cast_op = torch.ops.autoparallel.dtype_cast.default
-        fwd_pre_cast: set[int] = set()
-        for param, _grad in get_param_and_grad_nodes(opt.graph).values():
-            n = param
-            while True:
-                if n.target == cast_op:
-                    break
-                users = list(n.users.keys())
-                if len(users) != 1:
-                    break
-                child = users[0]
-                if len(child.all_input_nodes) != 1:
-                    break
-                n = child
-            if n.target != cast_op:
-                continue
-            if n.meta["val"].dtype.itemsize >= param.meta["val"].dtype.itemsize:
-                continue  # only constrain downcasts
-            node = n
-            while node != param:
-                if node in opt.node_map:
-                    fwd_pre_cast.add(opt.node_map[node])
-                node = node.all_input_nodes[0]
+        # 2a. forward param-dtype forbidden (== add_grad_reduce_dtype_constraints, fwd).
+        fwd_pre_cast = opt._forward_precast_node_idxs()
         for key, dv in opt.decision_vars.items():
             if key[0] in fwd_pre_cast and dv.comm_cost > 0:
                 self.forbidden.add(key)
 
-        # 2. grad-reduce-dtype (backward) forbidden
-        #    (== add_grad_reduce_dtype_constraints backward part).
+        # 2. grad-reduce-dtype backward forbidden (== add_grad_reduce_dtype_constraints, bwd).
         if getattr(opt, "force_grad_reduce_in_higher_precision", False):
-            cast_op = torch.ops.autoparallel.dtype_cast.default
-            pre_cast: set[int] = set()
-            for param, grad in get_param_and_grad_nodes(opt.graph).values():
-                if grad is None:
-                    continue
-                chain = [grad]
-                n = grad
-                while len(n.all_input_nodes) == 1:
-                    parent = n.all_input_nodes[0]
-                    if len(parent.all_input_nodes) != 1:
-                        break
-                    chain.append(parent)
-                    n = parent
-                cast_idx = next(
-                    (i for i, nd in enumerate(chain) if nd.target == cast_op), None
-                )
-                if cast_idx is None:
-                    continue
-                for nd in chain[cast_idx:]:
-                    if nd in opt.node_map:
-                        pre_cast.add(opt.node_map[nd])
+            pre_cast = opt._backward_precast_node_idxs()
             for key, dv in opt.decision_vars.items():
                 if key[0] in pre_cast and dv.comm_cost > 0:
                     self.forbidden.add(key)
