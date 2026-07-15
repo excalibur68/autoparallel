@@ -256,7 +256,6 @@ def load_optimizer(cls, path):
     opt.strats = strats
     opt.nodes = list(strats.keys())
     opt.node_map = {node: i for i, node in enumerate(opt.nodes)}
-    opt.solver_backend = "ilp"
     opt.force_grad_reduce_in_higher_precision = save_dict[
         "force_grad_reduce_in_higher_precision"
     ]
@@ -264,7 +263,6 @@ def load_optimizer(cls, path):
     opt._memory_constraint = None
     opt._node_constraint_names = {}
     opt._node_axis_constraints = defaultdict(list)
-    opt._fixed_vars = []
     opt._name_counters = {}
     # Loaded optimizers rebuild the PuLP problem below but carry no init-time
     # profiling; an empty profile lets solve-time profile writes/guards no-op.

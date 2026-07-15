@@ -297,62 +297,6 @@ class LPRelaxationResult:
     total_s: float
 
 
-@dataclass
-class DPTopology:
-    nodes: list[torch.fx.Node]
-    predecessors: dict[torch.fx.Node, list[torch.fx.Node]]
-    node_to_index: dict[torch.fx.Node, int]
-
-
-class DPBasedShardingSolver:
-    """EXPERIMENTAL / incomplete — not part of the supported solver path.
-
-    Only reachable when ``ShardingOptimizer`` is built with the non-default
-    ``solver_backend="dp"`` (not exposed through ``AutoParallel``), and today it
-    only builds a topological order: :meth:`get_solution` raises
-    ``NotImplementedError``. Kept for in-progress work; do not rely on it.
-    """
-
-    def __init__(self, optimizer):
-        self.optimizer = optimizer
-        self.topology: Optional[DPTopology] = None
-
-    def build_topological_order(self):
-        nodes = [node for node in self.optimizer.nodes if node.op != "output"]
-        node_to_index = {node: i for i, node in enumerate(nodes)}
-        predecessors = {}
-
-        for node in nodes:
-            node_predecessors = self.optimizer._all_input_nodes(node)
-            predecessors[node] = node_predecessors
-            node_index = node_to_index[node]
-            for pred in node_predecessors:
-                pred_index = node_to_index.get(pred)
-                if pred_index is None:
-                    raise RuntimeError(
-                        f"Predecessor {pred} for node {node} is missing from "
-                        "the DP topology"
-                    )
-                if pred_index >= node_index:
-                    raise RuntimeError(
-                        f"Predecessor {pred} for node {node} does not appear "
-                        "before it in topological order"
-                    )
-
-        self.topology = DPTopology(
-            nodes=nodes,
-            predecessors=predecessors,
-            node_to_index=node_to_index,
-        )
-        return self.topology
-
-    def get_solution(self, verbose=False):
-        raise NotImplementedError(
-            "DP-based sharding solver only builds topological order today; "
-            "strategy selection is not implemented yet."
-        )
-
-
 def _assert_has_tensor_meta(spec_or_specs, node, label):
     """Assert that all DTensorSpecs in a spec (possibly a tuple) have tensor_meta."""
     if isinstance(spec_or_specs, (list, tuple)):
@@ -374,16 +318,9 @@ class ShardingOptimizer:
         mesh,
         force_grad_reduce_in_higher_precision=False,
         repeated_subgraphs=False,
-        solver_backend="ilp",
         build_pulp=True,
     ):
         self.orig_gm = gm
-        if solver_backend not in {"ilp", "dp"}:
-            raise ValueError(
-                f"Unsupported solver_backend={solver_backend!r}; "
-                "expected 'ilp' or 'dp'"
-            )
-        self.solver_backend = solver_backend
         # When False, skip creating PuLP variables and constraints entirely.
         # decision_var costs + strategies + cluster_links are still built, which
         # is all the approximate solver needs (it derives the constraint topology
@@ -418,9 +355,6 @@ class ShardingOptimizer:
         self._node_axis_constraints: dict[
             str, list[tuple[int, Placement]]
         ] = defaultdict(list)
-        # Variables pinned to 0 by axis constraints applied with method="fix".
-        # Stored so they can be restored by remove_constraints / for re-solving.
-        self._fixed_vars: list = []
         self._name_counters: dict[str, int] = {}
         # Set by _build_decision_vars: the (node, arg, out, inp) keys whose
         # strategy edge has finite cost. Invalid (infinite-cost) edges are
@@ -465,37 +399,6 @@ class ShardingOptimizer:
         # _cluster_root_key / _linked_option_keys).
         self.cluster_links: dict[int, int] = {}
         self._root_to_copies: dict[int, list[int]] = defaultdict(list)
-        if self.solver_backend == "dp":
-            t0 = time.perf_counter()
-            self.solver = DPBasedShardingSolver(self)
-            topology = self.solver.build_topological_order()
-            t1 = time.perf_counter()
-            self.profile["dp"] = {
-                "topology_nodes": len(topology.nodes),
-                "topology_edges": sum(
-                    len(preds) for preds in topology.predecessors.values()
-                ),
-            }
-            self.profile["timings"].update(
-                {
-                    "topology_construction_s": t1 - t0,
-                    "init_total_s": t1 - t_init_start,
-                }
-            )
-            logger.info(
-                "ShardingOptimizer phase profile: phase=dp_topology "
-                "mesh_shape=%s mesh_dim_names=%s mesh_size=%s model_params=%s "
-                "topology_nodes=%s topology_edges=%s elapsed=%.3fs",
-                self.profile["mesh"]["shape"],
-                self.profile["mesh"]["dim_names"],
-                self.profile["mesh"]["size"],
-                self._format_billions(self.profile["model"]["parameter_numel"]),
-                self.profile["dp"]["topology_nodes"],
-                self.profile["dp"]["topology_edges"],
-                t1 - t0,
-            )
-            return
-
         if repeated_subgraphs:
             t = time.time()
             clusters = get_identical_regions(self.gm.graph, self.strats)
@@ -1498,6 +1401,14 @@ class ShardingOptimizer:
             terms.append(dv.var * dv.cost * multiplier)
         self.prob += pulp.lpSum(terms)
 
+    def _run_cbc(self, verbose=False):
+        """Solve ``self.prob`` with CBC in a scratch temp dir. Shared by the two
+        LP-relaxation paths (get_lower_bound / solve_lp_relaxation)."""
+        solver = pulp.PULP_CBC_CMD(msg=verbose)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            solver.tmpDir = tmpdir
+            self.prob.solve(solver)
+
     def get_lower_bound(self, verbose=False):
         """Solve the LP relaxation and return a lower bound on the ILP objective.
 
@@ -1506,11 +1417,6 @@ class ShardingOptimizer:
         then restores the optimizer state. The result is a certificate only:
         fractional LP values are not valid sharding placements.
         """
-        if self.solver_backend == "dp":
-            raise NotImplementedError(
-                "LP relaxation is only available for the PuLP-backed optimizer"
-            )
-
         t0 = time.perf_counter()
         old_objective = self.prob.objective
         old_status = self.prob.status
@@ -1536,11 +1442,8 @@ class ShardingOptimizer:
                 var.upBound = 1
                 var.varValue = None
 
-            solver = pulp.PULP_CBC_CMD(msg=verbose)
             t_solve0 = time.perf_counter()
-            with tempfile.TemporaryDirectory() as tmpdir:
-                solver.tmpDir = tmpdir
-                self.prob.solve(solver)
+            self._run_cbc(verbose)
             solve_s = time.perf_counter() - t_solve0
 
             status = pulp.LpStatus.get(self.prob.status, self.prob.status)
@@ -1720,10 +1623,7 @@ class ShardingOptimizer:
         try:
             for v in variables:
                 v.cat = pulp.LpContinuous  # bounds are already [0, 1] for binaries
-            solver = pulp.PULP_CBC_CMD(msg=verbose)
-            with tempfile.TemporaryDirectory() as tmpdir:
-                solver.tmpDir = tmpdir
-                self.prob.solve(solver)
+            self._run_cbc(verbose)
             solve_time = time.perf_counter() - t0
             objective = pulp.value(self.prob.objective)
             n_fractional = 0
@@ -1799,9 +1699,6 @@ class ShardingOptimizer:
         return {self._orig_to_concrete[node]: spec for node, spec in solution.items()}
 
     def get_solution(self, verbose=False):
-        if self.solver_backend == "dp":
-            return self.solver.get_solution(verbose=verbose)
-
         t0 = time.perf_counter()
         t_objective0 = time.perf_counter()
         self._set_objective()
@@ -2619,90 +2516,6 @@ class ShardingOptimizer:
         for name in names:
             self._node_constraint_names[name] = node.name
         return names
-
-    def add_node_axis_constraint(
-        self, node, mesh_dim, placement, constraint_name=None, method="constraint"
-    ):
-        """Force a node's output placement on a single mesh axis, leaving the
-        other axes free for the ILP.
-
-        This is the per-mesh-axis analogue of :meth:`add_node_constraint` and is
-        what sharding propagation emits: it can pin the tensor-parallel axis of a
-        weight while leaving the data axis open for FSDP.  Unlike
-        :meth:`add_node_constraint` it does *not* register the node in
-        ``_node_constraint_names``, so a partially-constrained parameter is still
-        counted by the memory budget and can be sharded on its free axes.
-
-        ``method`` controls how the pin is enforced:
-
-        * ``"constraint"`` adds an ``== 1`` equality over the matching decision
-          variables (removable by name via :meth:`remove_constraints`).
-        * ``"fix"`` instead sets the upper bound of the *non-matching* decision
-          variables to 0.  This shrinks the problem (the solver's presolve drops
-          fixed columns) rather than adding a row, which scales much better on
-          large meshes where adding thousands of equality rows otherwise slows
-          the solve.  It is not removable by constraint name.
-
-        For nodes with tuple output_specs the placement is matched against the
-        first DTensorSpec element, matching :meth:`add_node_constraint`.
-        """
-        node = self._normalize_node(node)
-        if constraint_name is None:
-            constraint_name = "axis_constraint"
-        self._constraint_log.append(
-            (
-                "add_node_axis_constraint",
-                {
-                    "node_name": node.name,
-                    "mesh_dim": mesh_dim,
-                    "placement": placement,
-                    "constraint_name": constraint_name,
-                    "method": method,
-                },
-            )
-        )
-        assert node in self.strats, (node, self.strats.keys())
-        strat = self.strats[node]
-        output_constraint_indices = []
-        for i, s in enumerate(strat.strategies):
-            specs = s.output_specs
-            spec = None
-            if isinstance(specs, DTensorSpec):
-                spec = specs
-            elif isinstance(specs, (list, tuple)):
-                spec = next((x for x in specs if isinstance(x, DTensorSpec)), None)
-            if spec is not None and spec.placements[mesh_dim] == placement:
-                output_constraint_indices.append(i)
-        if len(output_constraint_indices) == 0:
-            raise RuntimeError(
-                f"Couldn't find a strategy for {node} with {placement} on mesh "
-                f"dim {mesh_dim} (constraint {constraint_name})"
-            )
-        self._node_axis_constraints[node.name].append((mesh_dim, placement))
-        if method == "fix":
-            self._fix_node_output_indices(node, set(output_constraint_indices))
-            return []
-        if self.prob is None:
-            return []  # approx (lite) build replays this from _constraint_log
-        return self._add_node_constraint(
-            node,
-            output_constraint_indices=output_constraint_indices,
-            constraint_name=constraint_name,
-        )
-
-    def _fix_node_output_indices(self, node, keep_out_idxs):
-        """Pin a node's output strategy by fixing every decision variable whose
-        out_idx is not in ``keep_out_idxs`` to 0 (upper bound)."""
-        node_idx = self.node_map[node]
-        for argi, out_idx, inp_idx in self.walk_over_options(node):
-            if out_idx in keep_out_idxs:
-                continue
-            var = self._get_pulp_variable((node_idx, argi, out_idx, inp_idx))
-            if var is None:  # pruned (invalid) strategy edge, or lite (no-PuLP) build
-                continue
-            if var.upBound != 0:
-                var.upBound = 0
-                self._fixed_vars.append(var)
 
     def _add_io_placement_constraints(
         self,

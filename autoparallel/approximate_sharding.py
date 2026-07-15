@@ -172,11 +172,6 @@ class ApproximateShardingSolver:
 
     def _solve(self, verbose: bool = False):
         opt = self.opt
-        if getattr(opt, "solver_backend", "ilp") != "ilp":
-            raise RuntimeError(
-                "ApproximateShardingSolver requires an ILP-built optimizer "
-                "(decision_vars / pulp_variables / constraints)."
-            )
         t0 = time.perf_counter()
         self._build_problem()
         t_bp = time.perf_counter()
@@ -296,11 +291,11 @@ class ApproximateShardingSolver:
             if node.op != "output" and opt.node_map[node] not in cluster_linked
         ]
 
-        root_to_copies: dict[int, set] = defaultdict(set)
-        for copy_idx, root_idx in opt.cluster_links.items():
-            root_to_copies[root_idx].add(copy_idx)
+        # opt._root_to_copies maps a root node idx -> its cluster-copy node idxs
+        # (populated during the optimizer build); the multiplier counts a root
+        # plus its copies so clustered subgraphs are scored once per instance.
         self.node_mult = {
-            v: 1 + len(root_to_copies.get(v, ())) for v in self.cost_bearing
+            v: 1 + len(opt._root_to_copies.get(v, ())) for v in self.cost_bearing
         }
 
         self.allowed_out = {}
@@ -310,11 +305,10 @@ class ApproximateShardingSolver:
             self.allowed_out[opt.node_map[node]] = list(range(len(strat.strategies)))
 
         t = time.perf_counter()
-        if opt.prob is None:
-            # Lite build: no PuLP problem was constructed, derive topology directly.
-            paired_edges, authoritative = self._topology_direct()
-        else:
-            paired_edges, authoritative = self._parse_constraints()
+        # Derive the constraint topology directly from the graph + cluster_links +
+        # _constraint_log — no PuLP problem needed. Works on both the lite and the
+        # PuLP builds (byte-identical to parsing the PuLP constraints).
+        paired_edges, authoritative = self._topology_direct()
         # Flow edges are taken from the ILP's output_input_consistent constraints
         # (the authoritative producer per consumer-arg), NOT from _all_input_nodes:
         # the two disagree for some ops (einsum list-args, alias/backward nodes),
@@ -361,113 +355,16 @@ class ApproximateShardingSolver:
             "prune": time.perf_counter() - t_groups,
         }
 
-    # Constraint families that never restrict the per-node out_idx domain and
-    # are handled structurally (flow/uniqueness) or via the cost sentinel below.
-    # Skipping them by name avoids materializing items() for the ~majority of the
-    # (often >100k) constraints.
-    _SKIP_PREFIXES = (
-        "unique_decision",
-        "same_across_args",
-        "inf_cases",
-        "memory_constraint",
-    )
-
-    def _parse_constraints(self):
-        opt = self.opt
-        # inf-cost keys are forced to 0 by add_inf_cost_constraint, which also
-        # stamps dv.cost = 10000.0. Detect them directly instead of parsing the
-        # (very numerous) inf_cases constraints.
-        for key, dv in opt.decision_vars.items():
-            if dv.cost == 10000.0:
-                self.forbidden.add(key)
-
-        var_to_key = {var: key for key, var in opt.pulp_variables.items()}
-        restrict: dict[int, set] = {}
-        paired_edges: list[tuple[int, int, frozenset]] = []
-        # (consumer_idx, argi) -> set of producer_idx, from flow constraints. A
-        # clustered consumer's single inp variable is shared across all its
-        # copies, so the ILP couples one producer per copy (resolved to its root)
-        # to that inp, forcing them all equal; we collect the whole set.
-        authoritative: dict[tuple[int, int], set] = {}
-        for name, c in opt.prob.constraints.items():
-            if name.startswith("output_input_consistent"):
-                # +side = producer (grouped by out), -side = consumer (grouped by
-                # inp at a fixed arg). One +var and one -var pin down the edge.
-                pos_key = neg_key = None
-                for var, coeff in c.items():
-                    k = var_to_key.get(var)
-                    if k is None:
-                        continue
-                    if coeff > 0:
-                        pos_key = pos_key or k
-                    else:
-                        neg_key = neg_key or k
-                    if pos_key is not None and neg_key is not None:
-                        break
-                if pos_key is not None and neg_key is not None:
-                    authoritative.setdefault((neg_key[0], neg_key[1]), set()).add(
-                        pos_key[0]
-                    )
-                continue
-            if name.startswith(self._SKIP_PREFIXES):
-                continue
-            items = list(c.items())
-            if not items:
-                continue
-            rhs = -c.constant
-            coeffs = [coeff for _, coeff in items]
-            keys = [var_to_key.get(var) for var, _ in items]
-            if any(k is None for k in keys):
-                continue
-            all_pos = all(coeff > 0 for coeff in coeffs)
-            if c.sense == pulp.LpConstraintEQ and rhs == 0 and all_pos:
-                self.forbidden.update(keys)  # Σ vars == 0  (inf / dtype / disable)
-            elif c.sense == pulp.LpConstraintEQ and rhs == 1 and all_pos:
-                nodes = {k[0] for k in keys}
-                if len(nodes) == 1:
-                    n = next(iter(nodes))
-                    out_set = {k[2] for k in keys}
-                    restrict[n] = restrict.get(n, out_set) & out_set
-            elif (
-                c.sense == pulp.LpConstraintEQ
-                and rhs == 0
-                and any(name.startswith(p) for p in _PAIRED_PREFIXES)
-                and "disable" not in name
-            ):
-                pos = {k for k, coeff in zip(keys, coeffs) if coeff > 0}
-                neg = {k for k, coeff in zip(keys, coeffs) if coeff < 0}
-                na, nb = {k[0] for k in neg}, {k[0] for k in pos}
-                oa, ob = {k[2] for k in neg}, {k[2] for k in pos}
-                if len(na) == 1 and len(nb) == 1 and len(oa) == 1 and len(ob) == 1:
-                    paired_edges.append(
-                        (
-                            next(iter(na)),
-                            next(iter(nb)),
-                            frozenset({(next(iter(oa)), next(iter(ob)))}),
-                        )
-                    )
-        # method="fix" axis pins leave no PuLP row to parse above, so replay the
-        # log to recover them (constraint-method pins are also picked up here,
-        # idempotently with their == 1 rows).
-        for n, out_set in self._axis_restrict_from_log().items():
-            restrict[n] = restrict.get(n, out_set) & out_set
-        for n, out_set in restrict.items():
-            if n in self.allowed_out:
-                self.allowed_out[n] = [o for o in self.allowed_out[n] if o in out_set]
-        return paired_edges, authoritative
-
     def _topology_direct(self):
-        """Compute the same topology (forbidden / out_idx restrictions / paired
-        edges / flow producers) that _parse_constraints extracts, but directly
-        from the graph + cluster_links + _constraint_log, WITHOUT a PuLP problem.
-        This lets the optimizer skip building millions of PuLP variables and
-        constraints when only the approximate solver is used.
+        """Compute the topology (forbidden / out_idx restrictions / paired edges /
+        flow producers) directly from the graph + cluster_links + _constraint_log,
+        WITHOUT a PuLP problem. Used for every build (the lite build has no PuLP at
+        all; on a PuLP build this avoids re-parsing millions of constraint rows).
 
         Mirrors ShardingOptimizer.add_inf_cost_constraint /
         add_grad_reduce_dtype_constraints / add_forward_backward_consistency_constraints /
         _add_paired_output_constraint / add_node_constraint /
-        add_output_input_consistent_constraint. Verified byte-identical to
-        _parse_constraints on a full build (see tests)."""
+        add_output_input_consistent_constraint (see tests for the equivalence)."""
         from torch._functorch._aot_autograd.fx_utils import (
             get_param_and_grad_nodes,
             get_plain_input_and_grad_nodes,
@@ -607,12 +504,6 @@ class ApproximateShardingSolver:
                             break
             r = nroot(opt.node_map[node])
             restrict[r] = restrict.get(r, out_set) & out_set
-        # 4b. per-axis placement restrictions (== add_node_axis_constraint), what
-        #     sharding propagation emits. With method="fix" these leave no PuLP
-        #     row to parse, so replaying the log is the only way the approx solver
-        #     sees the pin.
-        for r, out_set in self._axis_restrict_from_log().items():
-            restrict[r] = restrict.get(r, out_set) & out_set
         for n_idx, out_set in restrict.items():
             if n_idx in self.allowed_out:
                 self.allowed_out[n_idx] = [
@@ -645,64 +536,12 @@ class ApproximateShardingSolver:
 
         return paired_edges, authoritative
 
-    def _axis_restrict_from_log(self):
-        """out_idx restrictions implied by add_node_axis_constraint calls,
-        replayed from _constraint_log → {root_node_idx: set(out_idx)}.
-
-        This is how the approximate solver honors propagated per-axis pins: keep
-        only the strategies whose output placement matches the pinned axis,
-        exactly like ShardingOptimizer.add_node_axis_constraint. It works whether
-        the pin was applied as a PuLP row ("constraint") or as variable bounds
-        ("fix", which leaves no row to parse) and in the lite (no-PuLP) build."""
-        opt = self.opt
-        node_root = dict(opt.cluster_links)  # node-level: copy idx -> root idx
-        restrict: dict[int, set] = {}
-        for fname, kwargs in getattr(opt, "_constraint_log", []):
-            if fname != "add_node_axis_constraint":
-                continue
-            node = next(
-                (nd for nd in opt.nodes if nd.name == kwargs["node_name"]), None
-            )
-            if node is None or node not in opt.strats:
-                continue
-            mesh_dim, placement = kwargs["mesh_dim"], kwargs["placement"]
-            out_set = set()
-            for i, s in enumerate(opt.strats[node].strategies):
-                specs = s.output_specs
-                if isinstance(specs, DTensorSpec):
-                    spec = specs
-                elif isinstance(specs, (list, tuple)):
-                    spec = next((x for x in specs if isinstance(x, DTensorSpec)), None)
-                else:
-                    spec = None
-                if spec is not None and spec.placements[mesh_dim] == placement:
-                    out_set.add(i)
-            r = node_root.get(opt.node_map[node], opt.node_map[node])
-            restrict[r] = restrict.get(r, out_set) & out_set
-        return restrict
-
     def _is_forbidden(self, key) -> bool:
         """A strategy edge is forbidden if a constraint ruled it out OR it was
         pruned for infinite cost. Pruning removes such keys from decision_vars
         entirely (see ShardingOptimizer._build_decision_vars), so a key missing
         from decision_vars is just as forbidden as one in ``self.forbidden``."""
         return key in self.forbidden or key not in self.opt.decision_vars
-
-    def _surviving_dv(self, v, argi, o):
-        """A DecisionVar for (v, argi, o, *) using any inp_idx that survived
-        pruning, or None if every edge for that (arg, out) was pruned.
-        compute_cost / input_spec are identical across inp_idx for a fixed out."""
-        strat = self.opt.strats[self.opt.nodes[v]].strategies[o]
-        n_inp = (
-            len(strat.redistribute_cost[argi])
-            if argi < len(strat.redistribute_cost)
-            else 1
-        )
-        for inp in range(n_inp):
-            dv = self.opt.decision_vars.get((v, argi, o, inp))
-            if dv is not None:
-                return dv
-        return None
 
     def _out_fully_forbidden(self, v, node, o):
         strat = self.opt.strats[node].strategies[o]
@@ -857,7 +696,7 @@ class ApproximateShardingSolver:
         opt = self.opt
         strat = opt.strats[node].strategies[o]
         mult = self.node_mult[v]
-        dv0 = self._surviving_dv(v, 0, o)
+        dv0 = self.opt._find_decision_var(v, 0, o)
         if dv0 is None:
             return INF  # every edge for this output strategy was pruned
         lb = dv0.compute_cost * len(strat.redistribute_cost)
@@ -922,7 +761,7 @@ class ApproximateShardingSolver:
         }
 
     def _param_ratio(self, v, node, o):
-        spec = self._surviving_dv(v, 0, o).input_spec
+        spec = self.opt._find_decision_var(v, 0, o).input_spec
         new_shape, _ = _get_sharded_shape_stride(spec)
         return math.prod(new_shape) / math.prod(spec.tensor_meta.shape)
 
@@ -984,7 +823,7 @@ class ApproximateShardingSolver:
         for i, o in enumerate(out_indices):
             strat = opt.strats[node].strategies[o]
             n_args = len(strat.redistribute_cost)
-            dv0 = self._surviving_dv(m, 0, o)
+            dv0 = self.opt._find_decision_var(m, 0, o)
             if dv0 is None:  # whole output strategy pruned
                 out[i] = BIG
                 continue
