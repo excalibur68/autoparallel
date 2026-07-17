@@ -25,4 +25,6 @@ If you're new to the project, use the reading order below.
 
 - [Sharding Annotations and Shardy-like Propagation](sharding_annotations.md)
 - [Using `local_map` for MoE and Custom Communication Patterns](local_map_and_moe.md)
+- [Running `local_map` MoE on 3D+ Meshes](local_map_higher_rank_meshes.md)
+- [Factored Seed + Radius-2 ILP Workflow](factored_seed_r2_ilp_workflow.md)
 - [Saving and Loading Optimizer State](save_load.md)

@@ -111,6 +111,153 @@ def _divisors(n: int) -> list[int]:
     return sorted(result)
 
 
+def _log2_power_of_two(n: int, name: str) -> int:
+    if n < 1 or n & (n - 1):
+        raise ValueError(f"{name} must be a positive power of two, got {n}")
+    return n.bit_length() - 1
+
+
+def fabric_exponents_from_nccl_topo(
+    total_gpus: int,
+    topo_config: NCCLTopoConfig,
+    *,
+    inter_name: str = "rdma",
+    intra_name: str = "nvlink",
+) -> tuple[tuple[str, int], ...]:
+    """Return outer-to-inner power-of-2 fabric spans for an NCCL topology.
+
+    The current NCCL cost model exposes two placement tiers: inter-node and
+    intra-node.  For a power-of-2 world size, that corresponds to a run of
+    inter-node bits followed by the node-local bits.  More detailed future
+    topologies (for example RDMA/NVL/NVLink) can be passed directly to
+    ``generate_fabric_mesh_shapes`` as explicit fabric exponents.
+    """
+
+    capacity = topo_config.num_nodes * topo_config.gpus_per_node
+    if total_gpus > capacity:
+        raise ValueError(
+            f"total_gpus={total_gpus} exceeds NCCL topology capacity {capacity}"
+        )
+
+    total_exp = _log2_power_of_two(total_gpus, "total_gpus")
+    node_exp = _log2_power_of_two(topo_config.gpus_per_node, "gpus_per_node")
+    intra_exp = min(total_exp, node_exp)
+    inter_exp = total_exp - intra_exp
+
+    segments: list[tuple[str, int]] = []
+    if inter_exp:
+        segments.append((inter_name, inter_exp))
+    if intra_exp:
+        segments.append((intra_name, intra_exp))
+    return tuple(segments)
+
+
+def _normalize_fabric_exponents(
+    total_gpus: int,
+    fabric_exponents: tuple[tuple[str, int], ...],
+) -> tuple[tuple[str, int], ...]:
+    total_exp = _log2_power_of_two(total_gpus, "total_gpus")
+    normalized: list[tuple[str, int]] = []
+    for name, exp in fabric_exponents:
+        exp = int(exp)
+        if exp < 0:
+            raise ValueError(f"fabric exponent for {name!r} must be non-negative")
+        if exp:
+            normalized.append((str(name), exp))
+
+    if not normalized:
+        raise ValueError("fabric_exponents must contain at least one non-zero span")
+    span_exp = sum(exp for _, exp in normalized)
+    if span_exp != total_exp:
+        raise ValueError(
+            "fabric exponents must sum to log2(total_gpus); "
+            f"got {span_exp}, expected {total_exp}"
+        )
+    return tuple(normalized)
+
+
+def _integer_partitions(
+    total: int,
+    n_parts: int,
+    *,
+    min_value: int = 1,
+) -> list[tuple[int, ...]]:
+    """Nondecreasing positive integer partitions of ``total``."""
+
+    if n_parts == 0:
+        return [()] if total == 0 else []
+    if total < n_parts * min_value:
+        return []
+
+    out: list[tuple[int, ...]] = []
+    for first in range(min_value, total + 1):
+        remaining = total - first
+        if n_parts > 1 and remaining < (n_parts - 1) * first:
+            break
+        for rest in _integer_partitions(remaining, n_parts - 1, min_value=first):
+            out.append((first,) + rest)
+    return out
+
+
+def generate_fabric_mesh_shapes(
+    total_gpus: int,
+    fabric_exponents: tuple[tuple[str, int], ...],
+    *,
+    max_ndim: int = 4,
+    include_dp_axis_when_one: bool = True,
+) -> list[tuple[int, ...]]:
+    """Generate canonical power-of-2 mesh shapes that do not cross fabric bounds.
+
+    ``fabric_exponents`` is an outer-to-inner sequence of ``(fabric, log2(size))``
+    spans, for example ``(("rdma", 6), ("nvlink", 3))`` for a 512-GPU
+    64-node x 8-GPU/node H100-style topology.  Mesh dim0 is treated as the DP
+    axis and is ordered; all non-DP dimensions within the same fabric are
+    canonicalized as unordered integer partitions, so shapes such as
+    ``(2, 2, 4, 8)`` and ``(2, 4, 2, 8)`` collapse to one candidate.
+    """
+
+    if max_ndim < 1:
+        raise ValueError(f"max_ndim must be at least 1, got {max_ndim}")
+    fabrics = _normalize_fabric_exponents(total_gpus, fabric_exponents)
+
+    shapes: set[tuple[int, ...]] = set()
+    first_name, first_exp = fabrics[0]
+    for dp_exp in range(first_exp + 1):
+        rem_fabrics = ((first_name, first_exp - dp_exp),) + fabrics[1:]
+        has_dp_axis = dp_exp > 0 or include_dp_axis_when_one
+        used_axes = 1 if has_dp_axis else 0
+        if used_axes > max_ndim:
+            continue
+
+        def visit(
+            fabric_idx: int,
+            remaining_axes: int,
+            tail_exponents: tuple[int, ...],
+        ) -> None:
+            if fabric_idx == len(rem_fabrics):
+                exponents = ((dp_exp,) if has_dp_axis else ()) + tail_exponents
+                if exponents and len(exponents) <= max_ndim:
+                    shapes.add(tuple(1 << exp for exp in exponents))
+                return
+
+            _, exp = rem_fabrics[fabric_idx]
+            if exp == 0:
+                visit(fabric_idx + 1, remaining_axes, tail_exponents)
+                return
+
+            for n_parts in range(1, min(exp, remaining_axes) + 1):
+                for part in _integer_partitions(exp, n_parts):
+                    visit(
+                        fabric_idx + 1,
+                        remaining_axes - n_parts,
+                        tail_exponents + part,
+                    )
+
+        visit(0, max_ndim - used_axes, ())
+
+    return sorted(shapes, key=lambda shape: (len(shape), shape))
+
+
 def infer_gpus_per_node(default: Optional[int] = None) -> Optional[int]:
     """Infer a canonical node size from the local CUDA device name."""
 

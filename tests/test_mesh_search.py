@@ -17,6 +17,8 @@ from autoparallel.cost_models.nccl_cost_model import (
 from autoparallel.mesh_search import (
     _factored_seed_cache_key,
     _factored_seed_dim_cost_model,
+    fabric_exponents_from_nccl_topo,
+    generate_fabric_mesh_shapes,
     generate_2d_semantic_mesh_candidates,
     generate_dp_tp_mesh_candidates,
     generate_semantic_mesh_candidates,
@@ -115,6 +117,58 @@ def test_generate_semantic_mesh_candidates_respects_max_ndim():
     )
 
     assert all(c.ndim <= 3 for c in candidates)
+
+
+def test_fabric_mesh_shapes_canonicalize_same_fabric_dims():
+    shapes = generate_fabric_mesh_shapes(
+        128,
+        (("rdma", 4), ("nvlink", 3)),
+        max_ndim=4,
+        include_dp_axis_when_one=True,
+    )
+
+    assert (2, 2, 4, 8) in shapes
+    assert (2, 4, 2, 8) not in shapes
+    assert all(len(shape) <= 4 for shape in shapes)
+
+
+def test_fabric_mesh_shapes_canonicalize_inner_fabric_dims():
+    shapes = generate_fabric_mesh_shapes(
+        64,
+        (("rdma", 3), ("nvlink", 3)),
+        max_ndim=4,
+        include_dp_axis_when_one=True,
+    )
+
+    assert (2, 4, 2, 4) in shapes
+    assert (2, 4, 4, 2) not in shapes
+
+
+def test_fabric_mesh_shapes_from_h100_topology_count_ws512():
+    config = h100_topo_config(num_nodes=64, gpus_per_node=8)
+    fabric_exponents = fabric_exponents_from_nccl_topo(512, config)
+
+    shapes = generate_fabric_mesh_shapes(512, fabric_exponents)
+
+    assert fabric_exponents == (("rdma", 6), ("nvlink", 3))
+    assert len(shapes) == 24
+    assert (1, 64, 8) in shapes
+    assert (64, 8) in shapes
+    assert (16, 8, 4) not in shapes
+
+
+def test_fabric_mesh_shapes_reject_non_power_of_two_topology():
+    config = h100_topo_config(num_nodes=16, gpus_per_node=6)
+
+    with pytest.raises(ValueError, match="gpus_per_node"):
+        fabric_exponents_from_nccl_topo(64, config)
+
+
+def test_fabric_mesh_shapes_reject_topology_capacity_overflow():
+    config = h100_topo_config(num_nodes=4, gpus_per_node=8)
+
+    with pytest.raises(ValueError, match="capacity"):
+        fabric_exponents_from_nccl_topo(64, config)
 
 
 def test_rank_mesh_candidates_treats_only_all_dp_as_baseline():
