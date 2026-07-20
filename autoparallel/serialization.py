@@ -263,8 +263,6 @@ def load_optimizer(cls, path):
     opt._constraint_log = []
     opt._memory_constraint = None
     opt._node_constraint_names = {}
-    opt._node_axis_constraints = defaultdict(list)
-    opt._fixed_vars = []
     opt._name_counters = {}
     # Loaded optimizers rebuild the PuLP problem below but carry no init-time
     # profiling; an empty profile lets solve-time profile writes/guards no-op.

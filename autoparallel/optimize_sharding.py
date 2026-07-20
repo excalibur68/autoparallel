@@ -138,59 +138,6 @@ def _skip_enumeration_redistribute_cost():
         _dt_utils.redistribute_cost = orig
 
 
-# Number of fork workers for the per-edge cost computation in _build_decision_vars
-# (the dominant cost of build on large/3D meshes). 1 = serial (use for A/B
-# verification); default scales with cores. The computation is per-node
-# independent and deterministic, so the parallel result is byte-identical.
-_PARALLEL_BUILD_WORKERS = int(
-    os.environ.get("AP_PARALLEL_BUILD", str(min(32, (os.cpu_count() or 1))))
-)
-
-# Set to the optimizer before forking cost workers; the workers read it from the
-# fork-inherited address space (no pickling of the mesh / strategy graph).
-_FORK_OPT: "ShardingOptimizer | None" = None
-
-
-def _par_node_edge_costs(node_idx):
-    """Worker: compute the per-edge (comm, transition) costs and the per-strategy
-    compute cost for one root node, reading the fork-inherited optimizer. Pure —
-    it reads strats and mutates nothing; the parent assembles DecisionVars from
-    these primitives. Returns (node_idx, out_data) where
-    out_data[out_idx] = (per_arg_compute, arg_rows) and
-    arg_rows[argi][inp_idx] = (comm_cost, transition_cost)."""
-    opt = _FORK_OPT
-    node = opt.nodes[node_idx]
-    op_strategy = opt.strats[node]
-    num_args = len(op_strategy.strategies[0].input_specs)
-    all_input_nodes = opt._all_input_nodes(node)
-    producer_strategies = [opt.strats[n] for n in all_input_nodes]
-    out_data = []
-    for output_strategy in op_strategy.strategies:
-        per_arg_compute = (
-            estimate_strategy_runtime_cost(node, output_strategy) / num_args
-        )
-        arg_rows = []
-        for argi, redist_costs in enumerate(output_strategy.redistribute_cost):
-            producer_strategy = (
-                producer_strategies[argi] if argi < len(producer_strategies) else None
-            )
-            arg_rows.append(
-                [
-                    opt._compute_edge_costs(
-                        node,
-                        output_strategy,
-                        argi,
-                        inp_idx,
-                        default_comm_cost,
-                        producer_strategy,
-                    )
-                    for inp_idx, default_comm_cost in enumerate(redist_costs)
-                ]
-            )
-        out_data.append((per_arg_compute, arg_rows))
-    return node_idx, out_data
-
-
 def concretize_symint(val):
     """Concretize a SymInt to a plain int, pass through other values.
 
@@ -432,17 +379,6 @@ class ShardingOptimizer:
         # so that _apply_memory_constraint can exclude constrained params and
         # remove_constraints can keep this in sync.
         self._node_constraint_names: dict[str, str] = {}
-        # Maps node_name → list of (mesh_dim, placement) per-axis constraints.
-        # A per-axis constraint keeps a param in the memory budget (unlike a full
-        # node constraint) but restricts which strategies it can use, so the
-        # budget must compute its best achievable memory ratio over only the
-        # strategies that satisfy these constraints.
-        self._node_axis_constraints: dict[
-            str, list[tuple[int, Placement]]
-        ] = defaultdict(list)
-        # Variables pinned to 0 by axis constraints applied with method="fix".
-        # Stored so they can be restored by remove_constraints / for re-solving.
-        self._fixed_vars: list = []
         self._name_counters: dict[str, int] = {}
         # Set by _build_decision_vars: the (node, arg, out, inp) keys whose
         # strategy edge has finite cost. Invalid (infinite-cost) edges are
@@ -1061,16 +997,14 @@ class ShardingOptimizer:
             (self.node_map[node], node, strat) for node, strat in self.strats.items()
         ]
 
-        # Phase A: compute every root node's per-edge costs. This (the comm-cost
-        # estimate over millions of edges) dominates build, is per-node
-        # independent, and mutates nothing, so it runs across forked workers.
+        # Phase A: compute every root node's per-edge costs.
         root_idxs = [
             node_idx
             for node_idx, node, _ in strats_items
             if node.op != "output" and node_idx not in self._cluster_linked_node_idxs
         ]
         tc0 = time.perf_counter()
-        node_results = self._compute_node_edge_costs(root_idxs)
+        node_results = [self._compute_node_edge_costs(idx) for idx in root_idxs]
         t_edge = time.perf_counter() - tc0
 
         # Phase B: assemble decision vars (and PuLP variables) from the computed
@@ -1211,38 +1145,40 @@ class ShardingOptimizer:
         )
         return {}
 
-    def _compute_node_edge_costs(self, root_idxs):
-        """Phase A of _build_decision_vars: per-root-node edge costs. Parallel
-        across forked workers when enabled; workers read this optimizer from the
-        fork-inherited address space (no pickling of the mesh / strategy graph)
-        and return only primitive cost tuples. The computation is deterministic,
-        so the parallel result is byte-identical to the serial path."""
-        global _FORK_OPT
-        _FORK_OPT = self
-        try:
-            # Forking a process that has already initialized CUDA crashes the
-            # workers ("Cannot re-initialize CUDA in forked subprocess") once they
-            # touch the NCCL cost model. Real-GPU runs (examples, torchrun) and
-            # any test that has touched CUDA hit this, so fall back to the
-            # (byte-identical) serial path whenever CUDA is live.
-            if (
-                _PARALLEL_BUILD_WORKERS <= 1
-                or len(root_idxs) < 64
-                or torch.cuda.is_initialized()
-            ):
-                return [_par_node_edge_costs(ni) for ni in root_idxs]
-            import multiprocessing as mp
-
-            ctx = mp.get_context("fork")
-            with ctx.Pool(_PARALLEL_BUILD_WORKERS) as pool:
-                # imap (ordered), not imap_unordered: results come back in
-                # root_idxs order so decision_vars is assembled in the same node
-                # order as the serial path. This keeps the PuLP objective's
-                # lpSum term order identical too, so even the ILP path is
-                # bit-for-bit unchanged (float addition is not associative).
-                return list(pool.imap(_par_node_edge_costs, root_idxs, chunksize=4))
-        finally:
-            _FORK_OPT = None
+    def _compute_node_edge_costs(self, node_idx):
+        """Compute per-edge costs for one root node."""
+        node = self.nodes[node_idx]
+        op_strategy = self.strats[node]
+        num_args = len(op_strategy.strategies[0].input_specs)
+        input_nodes = self._all_input_nodes(node)
+        producer_strategies = [self.strats[n] for n in input_nodes]
+        out_data = []
+        for output_strategy in op_strategy.strategies:
+            per_arg_compute = (
+                estimate_strategy_runtime_cost(node, output_strategy) / num_args
+            )
+            arg_rows = []
+            for argi, redist_costs in enumerate(output_strategy.redistribute_cost):
+                producer_strategy = (
+                    producer_strategies[argi]
+                    if argi < len(producer_strategies)
+                    else None
+                )
+                arg_rows.append(
+                    [
+                        self._compute_edge_costs(
+                            node,
+                            output_strategy,
+                            argi,
+                            inp_idx,
+                            default_comm_cost,
+                            producer_strategy,
+                        )
+                        for inp_idx, default_comm_cost in enumerate(redist_costs)
+                    ]
+                )
+            out_data.append((per_arg_compute, arg_rows))
+        return node_idx, out_data
 
     def _resolve_decision_var(self, key):
         """Return a DecisionVar for key, reconstructing on the fly for linked keys."""
@@ -2646,14 +2582,7 @@ class ShardingOptimizer:
                 continue
             node_idx = self.node_map[node]
             num_out_strat = len(self.strats[node].strategies)
-            # Per-axis constraints restrict which strategies this param may use,
-            # which raises its best achievable memory ratio (e.g. a param pinned
-            # to Replicate on the tensor axis can no longer be sharded there).
-            # The budget must reflect that, or it would under-allocate and make
-            # the problem spuriously infeasible.
-            axis_constraints = self._node_axis_constraints.get(node.name, [])
             ratios: list[float] = []
-            allowed_ratios: list[float] = []
             for out_idx in range(num_out_strat):
                 dv = self._find_decision_var(node_idx, 0, out_idx)
                 if dv is None:  # every edge for this strategy was pruned
@@ -2667,12 +2596,7 @@ class ShardingOptimizer:
                 ratio = new_size / old_size
                 ratios.append(ratio)
                 elms.append(dv.var * ratio)
-                out_spec = self.strats[node].strategies[out_idx].output_specs
-                if isinstance(out_spec, DTensorSpec) and all(
-                    out_spec.placements[m] == p for m, p in axis_constraints
-                ):
-                    allowed_ratios.append(ratio)
-            best_ratio: float = min(allowed_ratios) if allowed_ratios else min(ratios)
+            best_ratio: float = min(ratios)
             budget_low += max(best_ratio, memory_factor_low)
             budget_high += max(best_ratio, memory_factor_high)
 
@@ -2727,90 +2651,6 @@ class ShardingOptimizer:
         for name in names:
             self._node_constraint_names[name] = node.name
         return names
-
-    def add_node_axis_constraint(
-        self, node, mesh_dim, placement, constraint_name=None, method="constraint"
-    ):
-        """Force a node's output placement on a single mesh axis, leaving the
-        other axes free for the ILP.
-
-        This is the per-mesh-axis analogue of :meth:`add_node_constraint` and is
-        what sharding propagation emits: it can pin the tensor-parallel axis of a
-        weight while leaving the data axis open for FSDP.  Unlike
-        :meth:`add_node_constraint` it does *not* register the node in
-        ``_node_constraint_names``, so a partially-constrained parameter is still
-        counted by the memory budget and can be sharded on its free axes.
-
-        ``method`` controls how the pin is enforced:
-
-        * ``"constraint"`` adds an ``== 1`` equality over the matching decision
-          variables (removable by name via :meth:`remove_constraints`).
-        * ``"fix"`` instead sets the upper bound of the *non-matching* decision
-          variables to 0.  This shrinks the problem (the solver's presolve drops
-          fixed columns) rather than adding a row, which scales much better on
-          large meshes where adding thousands of equality rows otherwise slows
-          the solve.  It is not removable by constraint name.
-
-        For nodes with tuple output_specs the placement is matched against the
-        first DTensorSpec element, matching :meth:`add_node_constraint`.
-        """
-        node = self._normalize_node(node)
-        if constraint_name is None:
-            constraint_name = "axis_constraint"
-        self._constraint_log.append(
-            (
-                "add_node_axis_constraint",
-                {
-                    "node_name": node.name,
-                    "mesh_dim": mesh_dim,
-                    "placement": placement,
-                    "constraint_name": constraint_name,
-                    "method": method,
-                },
-            )
-        )
-        assert node in self.strats, (node, self.strats.keys())
-        strat = self.strats[node]
-        output_constraint_indices = []
-        for i, s in enumerate(strat.strategies):
-            specs = s.output_specs
-            spec = None
-            if isinstance(specs, DTensorSpec):
-                spec = specs
-            elif isinstance(specs, (list, tuple)):
-                spec = next((x for x in specs if isinstance(x, DTensorSpec)), None)
-            if spec is not None and spec.placements[mesh_dim] == placement:
-                output_constraint_indices.append(i)
-        if len(output_constraint_indices) == 0:
-            raise RuntimeError(
-                f"Couldn't find a strategy for {node} with {placement} on mesh "
-                f"dim {mesh_dim} (constraint {constraint_name})"
-            )
-        self._node_axis_constraints[node.name].append((mesh_dim, placement))
-        if method == "fix":
-            self._fix_node_output_indices(node, set(output_constraint_indices))
-            return []
-        if self.prob is None:
-            return []  # approx (lite) build replays this from _constraint_log
-        return self._add_node_constraint(
-            node,
-            output_constraint_indices=output_constraint_indices,
-            constraint_name=constraint_name,
-        )
-
-    def _fix_node_output_indices(self, node, keep_out_idxs):
-        """Pin a node's output strategy by fixing every decision variable whose
-        out_idx is not in ``keep_out_idxs`` to 0 (upper bound)."""
-        node_idx = self.node_map[node]
-        for argi, out_idx, inp_idx in self.walk_over_options(node):
-            if out_idx in keep_out_idxs:
-                continue
-            var = self._get_pulp_variable((node_idx, argi, out_idx, inp_idx))
-            if var is None:  # pruned (invalid) strategy edge, or lite (no-PuLP) build
-                continue
-            if var.upBound != 0:
-                var.upBound = 0
-                self._fixed_vars.append(var)
 
     def _add_io_placement_constraints(
         self,

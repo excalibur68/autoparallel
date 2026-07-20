@@ -472,11 +472,6 @@ class ApproximateShardingSolver:
                             frozenset({(next(iter(oa)), next(iter(ob)))}),
                         )
                     )
-        # method="fix" axis pins leave no PuLP row to parse above, so replay the
-        # log to recover them (constraint-method pins are also picked up here,
-        # idempotently with their == 1 rows).
-        for n, out_set in self._axis_restrict_from_log().items():
-            restrict[n] = restrict.get(n, out_set) & out_set
         for n, out_set in restrict.items():
             if n in self.allowed_out:
                 self.allowed_out[n] = [o for o in self.allowed_out[n] if o in out_set]
@@ -637,12 +632,6 @@ class ApproximateShardingSolver:
                             break
             r = nroot(opt.node_map[node])
             restrict[r] = restrict.get(r, out_set) & out_set
-        # 4b. per-axis placement restrictions (== add_node_axis_constraint), what
-        #     sharding propagation emits. With method="fix" these leave no PuLP
-        #     row to parse, so replaying the log is the only way the approx solver
-        #     sees the pin.
-        for r, out_set in self._axis_restrict_from_log().items():
-            restrict[r] = restrict.get(r, out_set) & out_set
         for n_idx, out_set in restrict.items():
             if n_idx in self.allowed_out:
                 self.allowed_out[n_idx] = [
@@ -674,42 +663,6 @@ class ApproximateShardingSolver:
                 authoritative.setdefault((nroot(u_idx), argi), set()).add(p_root)
 
         return paired_edges, authoritative
-
-    def _axis_restrict_from_log(self):
-        """out_idx restrictions implied by add_node_axis_constraint calls,
-        replayed from _constraint_log → {root_node_idx: set(out_idx)}.
-
-        This is how the approximate solver honors propagated per-axis pins: keep
-        only the strategies whose output placement matches the pinned axis,
-        exactly like ShardingOptimizer.add_node_axis_constraint. It works whether
-        the pin was applied as a PuLP row ("constraint") or as variable bounds
-        ("fix", which leaves no row to parse) and in the lite (no-PuLP) build."""
-        opt = self.opt
-        node_root = dict(opt.cluster_links)  # node-level: copy idx -> root idx
-        restrict: dict[int, set] = {}
-        for fname, kwargs in getattr(opt, "_constraint_log", []):
-            if fname != "add_node_axis_constraint":
-                continue
-            node = next(
-                (nd for nd in opt.nodes if nd.name == kwargs["node_name"]), None
-            )
-            if node is None or node not in opt.strats:
-                continue
-            mesh_dim, placement = kwargs["mesh_dim"], kwargs["placement"]
-            out_set = set()
-            for i, s in enumerate(opt.strats[node].strategies):
-                specs = s.output_specs
-                if isinstance(specs, DTensorSpec):
-                    spec = specs
-                elif isinstance(specs, (list, tuple)):
-                    spec = next((x for x in specs if isinstance(x, DTensorSpec)), None)
-                else:
-                    spec = None
-                if spec is not None and spec.placements[mesh_dim] == placement:
-                    out_set.add(i)
-            r = node_root.get(opt.node_map[node], opt.node_map[node])
-            restrict[r] = restrict.get(r, out_set) & out_set
-        return restrict
 
     def _is_forbidden(self, key) -> bool:
         """A strategy edge is forbidden if a constraint ruled it out OR it was
