@@ -177,17 +177,20 @@ def _replace_region(
 ):
     old_num_activations = _body(gm, forward).meta.get("num_activations", 0)
     num_outputs = len(kwargs["out_placements"])
-    old_activations = sorted(
-        (
-            user
-            for user in forward.users
-            if user.op == "call_function"
-            and user.target == operator.getitem
-            and isinstance(user.args[1], int)
-            and user.args[1] >= num_outputs
-        ),
-        key=lambda node: node.args[1],
-    )
+    if backward is None:
+        old_activations = sorted(
+            (
+                user
+                for user in forward.users
+                if user.op == "call_function"
+                and user.target == operator.getitem
+                and isinstance(user.args[1], int)
+                and user.args[1] >= num_outputs
+            ),
+            key=lambda node: node.args[1],
+        )
+    else:
+        old_activations = list(backward.args[1 : 1 + old_num_activations])
     if len(old_activations) != old_num_activations:
         raise RuntimeError(
             f"flex_local_map node {forward.name} has {len(old_activations)} "
@@ -218,8 +221,9 @@ def _replace_region(
     forward_spec.output_specs = (
         tuple(forward_spec.output_specs[:num_outputs]) + activation_specs
     )
-    for node, spec in zip(new_activations, activation_specs):
-        solution[node] = OpSpec(spec, (spec,), [[0.0]])
+    for node, value, spec in zip(new_activations, activations, activation_specs):
+        if isinstance(value, torch.Tensor):
+            solution[node] = OpSpec(spec, (spec,), [[0.0]])
 
     if backward is not None:
         old_tensor_activations = sum(
@@ -238,9 +242,18 @@ def _replace_region(
             [0.0] for _ in tensor_activation_specs
         ] + list(backward_spec.redistribute_cost[old_tensor_activations:])
         gm.set_submodule(backward.args[0].target, backward_body)
+        backward_activations = [
+            node
+            for node, value in zip(new_activations, activations)
+            if not isinstance(value, torch.Tensor)
+        ] + [
+            node
+            for node, value in zip(new_activations, activations)
+            if isinstance(value, torch.Tensor)
+        ]
         backward.args = (
             backward.args[0],
-            *new_activations,
+            *backward_activations,
             *backward.args[1 + old_num_activations :],
         )
         backward.meta.update(
@@ -248,8 +261,9 @@ def _replace_region(
         )
 
     for node in old_activations:
-        solution.pop(node, None)
-        gm.graph.erase_node(node)
+        if not node.users:
+            solution.pop(node, None)
+            gm.graph.erase_node(node)
 
 
 def _example_args(forward, trace_info):

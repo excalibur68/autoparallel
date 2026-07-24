@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+from functools import partial
 from typing import Optional
 
 import torch
@@ -13,8 +14,15 @@ from torch.distributed.tensor.placement_types import Shard
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
-from autoparallel._testing.models.dsv3 import DeepSeekV3Model, make_dsv3_config
+from autoparallel._testing.models.dsv3 import (
+    DeepSeekV3Model,
+    MoE,
+    _moe_local_map_kwargs,
+    local_mapped_region,
+    make_dsv3_config,
+)
 from autoparallel.api import AutoParallel
+from autoparallel.collectives import flex_local_map, get_flex_local_map_alternatives
 from autoparallel.shardings.placement_options import NumericsLogger
 
 _DEFAULT_DTENSOR_RNG_SEED = 0
@@ -24,7 +32,139 @@ def _seed_dtensor_rng(rng_seed: Optional[int]) -> None:
     torch.manual_seed(_DEFAULT_DTENSOR_RNG_SEED if rng_seed is None else rng_seed)
 
 
-def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
+def _moe_implementation_1(
+    x,
+    selected_experts_indices,
+    top_scores,
+    experts_w1,
+    experts_w3,
+    experts_w2,
+    out,
+    *,
+    top_k,
+    num_experts,
+    score_before_experts,
+    axis_name,
+):
+    return local_mapped_region(
+        x,
+        selected_experts_indices,
+        top_scores,
+        experts_w1,
+        experts_w3,
+        experts_w2,
+        out,
+        top_k,
+        num_experts,
+        score_before_experts,
+        axis_name,
+    )
+
+
+def _moe_implementation_2(
+    x,
+    selected_experts_indices,
+    top_scores,
+    experts_w1,
+    experts_w3,
+    experts_w2,
+    out,
+    *,
+    top_k,
+    num_experts,
+    score_before_experts,
+    axis_name,
+):
+    return local_mapped_region(
+        x,
+        selected_experts_indices,
+        top_scores,
+        experts_w1,
+        experts_w3,
+        experts_w2,
+        out,
+        top_k,
+        num_experts,
+        score_before_experts,
+        axis_name,
+    )
+
+
+def _unused_default_moe_implementation(*args):
+    raise AssertionError("flex_local_map alternatives must provide their own fn")
+
+
+class _FlexMoELocalMap(torch.nn.Module):
+    def __init__(self, moe, mesh):
+        super().__init__()
+        local_map_kwargs = _moe_local_map_kwargs(mesh)
+        static_kwargs = {
+            "top_k": moe.router.top_k,
+            "num_experts": moe.router.num_experts,
+            "score_before_experts": moe.score_before_experts,
+            "axis_name": moe.axis_name,
+        }
+        in_placements = local_map_kwargs["in_placements"][:7]
+        self.mapped_region = flex_local_map(
+            _unused_default_moe_implementation,
+            alternatives=[
+                {
+                    "name": "moe_implementation_2",
+                    "fn": partial(_moe_implementation_2, **static_kwargs),
+                    "in_placements": in_placements,
+                    "out_placements": local_map_kwargs["out_placements"],
+                    "cost_hint": 10.0,
+                },
+                {
+                    "name": "moe_implementation_1",
+                    "fn": partial(_moe_implementation_1, **static_kwargs),
+                    "in_placements": in_placements,
+                    "out_placements": local_map_kwargs["out_placements"],
+                    "cost_hint": 0.0,
+                },
+            ],
+            in_grad_placements=local_map_kwargs["in_grad_placements"],
+            device_mesh=mesh,
+            redistribute_inputs=local_map_kwargs["redistribute_inputs"],
+        )
+
+    def forward(
+        self,
+        x,
+        selected_experts_indices,
+        top_scores,
+        experts_w1,
+        experts_w3,
+        experts_w2,
+        out,
+        top_k,
+        num_experts,
+        score_before_experts,
+        axis_name,
+    ):
+        return self.mapped_region(
+            x,
+            selected_experts_indices,
+            top_scores,
+            experts_w1,
+            experts_w3,
+            experts_w2,
+            out,
+        )
+
+
+def _enable_flex_local_map(model, mesh):
+    for module in list(model.modules()):
+        if isinstance(module, MoE):
+            module.local_mapped_region = _FlexMoELocalMap(module, mesh)
+
+
+def run_test(
+    fake_evaluate: bool,
+    rng_seed: Optional[int],
+    logs_dir: str,
+    use_flex_local_map: bool,
+):
     # Match TorchTitan's DeepSeek V3 debug model shape. This example is a
     # regression guard for placement/clustering issues that only appear at the
     # larger debug shape used by TorchTitan GraphTrainer.
@@ -80,6 +220,8 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
             mesh=mesh,
             compute_dtype=torch.bfloat16,
         )
+    if use_flex_local_map:
+        _enable_flex_local_map(model, mesh)
 
     def input_fn():
         return torch.randint(
@@ -106,7 +248,19 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
         autop.add_input_constraints([x_sharding])
         autop.add_output_constraints([x_sharding])
 
+        flex_nodes = [
+            node
+            for node in autop.gm.graph.nodes
+            if get_flex_local_map_alternatives(node.meta.get("local_map_kwargs", {}))
+            is not None
+        ]
+        assert bool(flex_nodes) == use_flex_local_map
         sharding_placement = autop.optimize_placement(verbose=False)
+        if use_flex_local_map:
+            for node in flex_nodes:
+                spec = sharding_placement[node]
+                assert spec.flex_local_map_alternative_index == 1
+                assert spec.flex_local_map_alternative_name == "moe_implementation_1"
         parallel_mod = autop.apply_placement(sharding_placement)
 
     parallel_mod.to_empty(device=device)
@@ -185,11 +339,19 @@ if __name__ == "__main__":
         default="out/",
         help="Directory to store logs (default: ./out/).",
     )
+    parser.add_argument(
+        "--flex-local-map",
+        action="store_true",
+        help="Use two explicit MoE flex_local_map implementations.",
+    )
     args = parser.parse_args()
 
     if args.rng_seed is not None:
         torch.use_deterministic_algorithms(True)
 
     run_test(
-        fake_evaluate=args.fake_evaluate, rng_seed=args.rng_seed, logs_dir=args.logs_dir
+        fake_evaluate=args.fake_evaluate,
+        rng_seed=args.rng_seed,
+        logs_dir=args.logs_dir,
+        use_flex_local_map=args.flex_local_map,
     )
