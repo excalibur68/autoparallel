@@ -390,11 +390,13 @@ Usage constraint: apply `flex_local_map` **outside** `forward` and pass an expli
 carried on a tuple-subclass that Dynamo only preserves when it is a pre-existing
 (sourced) object; constructing the wrapper inside `forward` traces it as empty.
 
-Status: this wires the alternatives into the graph handed to the solver (one strategy
-per alternative, plus `cost_hint`), which the solver selects among. Running a
-*non-default* alternative end-to-end (backward-consistent apply) is not yet complete —
-today the backward `local_map` node is not alternative-aware and is not tied to the
-forward node's choice.
+`optimize_placement()` first selects an alternative while constraining the forward and
+backward nodes to the same index. This is the only ILP solve. It then captures the
+selected `fn` through the normal `local_map` Dynamo/AOT path and replaces that callsite's
+forward body, saved activations, and backward body in place. After finalization the node
+is an ordinary single-strategy `local_map` and follows the existing apply path. Only the
+selected function is captured. Alternative functions must preserve the same user-visible
+tensor contract and differentiable outputs; their internal saved activations may differ.
 
 ## `with_sharding_constraint` for simpler cases
 

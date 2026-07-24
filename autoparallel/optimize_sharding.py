@@ -91,6 +91,7 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_map_only
 
+from ._flex_local_map import flex_local_map_pairs
 from .collectives import get_flex_local_map_alternatives
 from .cost_models.collective_runtime_estimation import estimate_strategy_comms_cost
 from .cost_models.compute_estimation import (
@@ -827,6 +828,7 @@ class ShardingOptimizer:
         self.add_same_output_across_args_constraint()
         self.add_output_input_consistent_constraint()
         self.add_inf_cost_constraint()
+        self.add_flex_local_map_consistency_constraints()
         self.add_forward_backward_consistency_constraints()
         self.add_grad_reduce_dtype_constraints()
 
@@ -1467,6 +1469,44 @@ class ShardingOptimizer:
                 pulp.lpSum(v_b) == pulp.lpSum(v_a),
                 self._get_next_name(constraint_name),
             )
+
+    def add_flex_local_map_consistency_constraints(self):
+        """Force each flex callsite's forward and backward to use one alternative."""
+        for forward, backward in flex_local_map_pairs(self.strats):
+            if backward is None:
+                continue
+            forward_strategies = self.strats[forward].strategies
+            backward_strategies = self.strats[backward].strategies
+            forward_indices = [
+                getattr(strategy, "flex_local_map_alternative_index", None)
+                for strategy in forward_strategies
+            ]
+            backward_indices = [
+                getattr(strategy, "flex_local_map_alternative_index", None)
+                for strategy in backward_strategies
+            ]
+            if None in forward_indices or forward_indices != backward_indices:
+                raise RuntimeError(
+                    f"flex_local_map seq_nr={forward.meta.get('seq_nr')} has "
+                    "inconsistent forward and backward alternatives"
+                )
+
+            for alternative_index in forward_indices:
+                expressions = []
+                for node in (forward, backward):
+                    node_idx = self.node_map[node]
+                    variables = [
+                        self._get_pulp_variable((node_idx, argi, candidate, inp_idx))
+                        for argi, candidate, inp_idx in self.walk_over_options(
+                            node, constrain_arg=0
+                        )
+                        if candidate == alternative_index
+                    ]
+                    expressions.append(pulp.lpSum(variables))
+                self.prob += (
+                    expressions[0] == expressions[1],
+                    self._get_next_name("flex_local_map_fw_bw"),
+                )
 
     def add_forward_backward_consistency_constraints(self):
         """USER (Category 5c): Forward-backward consistency constraints.

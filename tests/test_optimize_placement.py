@@ -478,6 +478,192 @@ def _flex_attention_body(query, key, value):
     return (out,)
 
 
+def _flex_clone_body(x):
+    return (x.clone(),)
+
+
+def _flex_where_identity_body(x):
+    return (torch.where(x == x, x, x).clone(),)
+
+
+def _flex_sin_body(x):
+    return (torch.sin(x),)
+
+
+def _flex_shifted_cos_body(x):
+    return (torch.cos(x - torch.pi / 2),)
+
+
+def _flex_sin_with_detached_body(x):
+    return torch.sin(x), x.detach().clone()
+
+
+def _flex_shifted_cos_with_detached_body(x):
+    return torch.cos(x - torch.pi / 2), x.detach().clone()
+
+
+def _make_flex_pointwise(mesh, default_fn, alternative_fn, out_placements):
+    in_placements = ((Replicate(),),)
+    return flex_local_map(
+        default_fn,
+        alternatives=[
+            {
+                "in_placements": in_placements,
+                "out_placements": out_placements,
+                "cost_hint": 100.0,
+            },
+            {
+                "fn": alternative_fn,
+                "in_placements": in_placements,
+                "out_placements": out_placements,
+                "cost_hint": 0.0,
+            },
+        ],
+        device_mesh=mesh,
+        redistribute_inputs=True,
+    )
+
+
+class FlexLocalMapDifferentActivations(nn.Module):
+    def __init__(self, mesh):
+        super().__init__()
+        self.scale = nn.Parameter(torch.empty(()))
+        placements = ((Replicate(),),)
+        self.pointwise = _make_flex_pointwise(
+            mesh,
+            _flex_clone_body,
+            _flex_where_identity_body,
+            placements,
+        )
+
+    def forward(self, x):
+        return self.pointwise(x * self.scale)[0]
+
+
+class FlexLocalMapMultiOutput(nn.Module):
+    def __init__(self, mesh):
+        super().__init__()
+        out_placements = ((Replicate(),), (Replicate(),))
+        self.pointwise = _make_flex_pointwise(
+            mesh,
+            _flex_sin_with_detached_body,
+            _flex_shifted_cos_with_detached_body,
+            out_placements,
+        )
+
+    def forward(self, x):
+        return self.pointwise(x)
+
+
+class RepeatedFlexLocalMap(nn.Module):
+    def __init__(self, mesh):
+        super().__init__()
+        placements = ((Replicate(),),)
+        self.pointwise = _make_flex_pointwise(
+            mesh,
+            _flex_sin_body,
+            _flex_shifted_cos_body,
+            placements,
+        )
+
+    def forward(self, x):
+        return self.pointwise(self.pointwise(x)[0])[0]
+
+
+@apply_cuda_patches
+def test_flex_local_map_selected_body_forward_backward(device_mesh_1d, device="cuda"):
+    shape = (512, 128)
+
+    def input_fn():
+        return torch.randn(*shape, device=device, requires_grad=True)
+
+    with torch.device("meta"):
+        model = FlexLocalMapDifferentActivations(device_mesh_1d)
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        replicated = (Replicate(),)
+        autop.add_input_constraints([replicated])
+        autop.add_output_constraints([replicated])
+        parallel_model = autop.apply_placement(autop.optimize_placement())
+
+    parallel_model.to_empty(device=device)
+    with torch.no_grad():
+        parallel_model.scale.fill_(1.25)
+    actual_input = torch.randn(*shape, device=device, requires_grad=True)
+    expected_input = actual_input.detach().clone().requires_grad_(True)
+    expected_scale = torch.tensor(1.25, device=device, requires_grad=True)
+    actual = parallel_model(actual_input)
+    expected = _flex_where_identity_body(expected_input * expected_scale)[0]
+    actual.sum().backward()
+    expected.sum().backward()
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_input.grad, expected_input.grad)
+    torch.testing.assert_close(
+        parallel_model.scale.grad.to_local(), expected_scale.grad
+    )
+
+
+@apply_cuda_patches
+def test_flex_local_map_selected_body_with_nondifferentiable_output(
+    device_mesh_1d, device="cuda"
+):
+    shape = (512, 128)
+
+    def input_fn():
+        return torch.randn(*shape, device=device, requires_grad=True)
+
+    with torch.device("meta"):
+        model = FlexLocalMapMultiOutput(device_mesh_1d)
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        replicated = (Replicate(),)
+        autop.add_input_constraints([replicated])
+        autop.add_output_constraints([replicated, replicated])
+        parallel_model = autop.apply_placement(autop.optimize_placement())
+
+    actual_input = torch.randn(*shape, device=device, requires_grad=True)
+    expected_input = actual_input.detach().clone().requires_grad_(True)
+    actual = parallel_model(actual_input)
+    expected = _flex_shifted_cos_with_detached_body(expected_input)
+    actual[0].sum().backward()
+    expected[0].sum().backward()
+
+    torch.testing.assert_close(actual[0], expected[0])
+    torch.testing.assert_close(actual[1], expected[1])
+    torch.testing.assert_close(actual_input.grad, expected_input.grad)
+
+
+@apply_cuda_patches
+def test_repeated_flex_local_map_selected_body_dynamic_shape(
+    device_mesh_1d, device="cuda"
+):
+    traced_shape = (512, 128)
+    runtime_shape = (256, 128)
+
+    def input_fn():
+        return torch.randn(*traced_shape, device=device, requires_grad=True)
+
+    with torch.device("meta"):
+        model = RepeatedFlexLocalMap(device_mesh_1d)
+
+    with AutoParallel(model, input_fn, device_mesh_1d, dynamic=True) as autop:
+        replicated = (Replicate(),)
+        autop.add_input_constraints([replicated])
+        autop.add_output_constraints([replicated])
+        parallel_model = autop.apply_placement(autop.optimize_placement())
+
+    actual_input = torch.randn(*runtime_shape, device=device, requires_grad=True)
+    expected_input = actual_input.detach().clone().requires_grad_(True)
+    actual = parallel_model(actual_input)
+    expected = _flex_shifted_cos_body(_flex_shifted_cos_body(expected_input)[0])[0]
+    actual.sum().backward()
+    expected.sum().backward()
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_input.grad, expected_input.grad)
+
+
 class FlexLocalMapTransformerBlock(nn.Module):
     def __init__(self, nheads, dim1, dim2, mesh):
         super().__init__()
@@ -654,11 +840,10 @@ def test_flex_local_map_backward_is_alternative_aware(device_mesh_2d, device="cu
             (Shard(0), Replicate()),
         }
 
+        fw_node, bw_node = _flex_fw_bw_nodes(list(autop.gm.graph.nodes))
         sharding_placement = autop.optimize_placement()
 
-    # Forward and backward are placed on the same alternative (no linking constraint
-    # needed — the solver selects them consistently).
-    fw_node, bw_node = _flex_fw_bw_nodes(list(autop.gm.graph.nodes))
+    # Forward and backward are placed on the same alternative.
     fw_idx = getattr(
         sharding_placement[fw_node], "flex_local_map_alternative_index", None
     )
