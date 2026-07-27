@@ -7,6 +7,7 @@ from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.collectives import with_sharding_constraint
 from autoparallel.compile import autoparallel_backend
 from autoparallel.input_validation import ForwardInputs
+from autoparallel.mesh_search import build_split_dim_seed
 from autoparallel.moe import (
     MoEMeshRoles,
     build_moe_local_map_placements,
@@ -22,4 +23,5 @@ __all__ = [
     "build_moe_local_map_placements",
     "build_moe_mesh",
     "with_sharding_constraint",
+    "build_split_dim_seed",
 ]

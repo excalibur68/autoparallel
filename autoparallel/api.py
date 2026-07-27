@@ -24,6 +24,7 @@ from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh
+from torch.distributed.tensor.placement_types import Placement
 from torch.export._trace import _restore_state_dict
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
@@ -256,6 +257,8 @@ class AutoParallel:
         repeated_subgraphs: bool = True,
         fast_build: bool = True,
         solver: str = "ilp",
+        strategy_radius: Optional[int] = None,
+        seed_input_placements: Optional[tuple[Placement, ...]] = None,
         lazy_costs: Optional[bool] = None,
     ):
         self.stack = ExitStack()
@@ -283,6 +286,8 @@ class AutoParallel:
         self.cost_model = cost_model
         self.repeated_subgraphs = repeated_subgraphs
         self.fast_build = fast_build
+        self.strategy_radius = strategy_radius
+        self.seed_input_placements = seed_input_placements
         # None => default per solver: approx builds lazy (no eager per-edge cost
         # estimation; the TRW-S solver computes costs on demand), ilp/lp build
         # eager (a PuLP objective needs the costs). True/False forces lazy/eager.
@@ -348,6 +353,23 @@ class AutoParallel:
                 and self.mp_policy.reduce_dtype.itemsize
                 > self.mp_policy.param_dtype.itemsize
             )
+            strategy_seed = None
+            if self.strategy_radius is not None:
+                assert self.seed_input_placements is not None, (
+                    "strategy_radius requires seed_input_placements "
+                    "(one input placement per mesh dim)"
+                )
+                from .mesh_search import build_split_dim_seed
+
+                strategy_seed = build_split_dim_seed(
+                    self.gm,
+                    tuple(self.mesh.shape),
+                    self.seed_input_placements,
+                    cost_model=self.cost_model,
+                    force_grad_reduce_in_higher_precision=force_grad_reduce_in_higher_precision,
+                    repeated_subgraphs=self.repeated_subgraphs,
+                    fast_build=self.fast_build,
+                )
             sharding_optimizer = ShardingOptimizer(
                 self.gm,
                 self.mesh,
@@ -360,6 +382,8 @@ class AutoParallel:
                     if self.lazy_costs is None
                     else (not self.lazy_costs)
                 ),
+                strategy_seed=strategy_seed,
+                strategy_radius=self.strategy_radius,
             )
 
             self.sharding_optimizer = sharding_optimizer

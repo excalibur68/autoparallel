@@ -103,8 +103,11 @@ from .graph_passes.graph_utils import (
     build_param_derived_set,
     build_terminal_derived_set,
 )
-from .shardings.placement_options import get_placement_options_for_node
-from .shardings.propagation_rules import _create_all_options
+from .shardings.placement_options import (
+    get_placement_options_for_node,
+    reset_placement_options_cache,
+)
+from .shardings.propagation_rules import _create_all_options, set_current_seed_node
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +277,8 @@ class ShardingOptimizer:
         fast_build=True,
         build_pulp=True,
         build_costs=True,
+        strategy_seed=None,
+        strategy_radius=None,
     ):
         self.orig_gm = gm
         self.fast_build = fast_build
@@ -304,6 +309,8 @@ class ShardingOptimizer:
         self.force_grad_reduce_in_higher_precision = (
             force_grad_reduce_in_higher_precision
         )
+        self.strategy_seed = strategy_seed
+        self.strategy_radius = strategy_radius
         self._constraint_log: list[tuple[str, dict]] = []
         self._memory_constraint: tuple[float, float] | None = None
         # Maps ILP constraint name → node_name for active node constraints,
@@ -318,7 +325,21 @@ class ShardingOptimizer:
         self.profile: dict[str, Any] = {"timings": {}}
         t_init_start = time.perf_counter()
         t0 = time.perf_counter()
-        self.strats = self.build_sharding_metadata()
+        if self.strategy_seed is None:
+            self.strats = self.build_sharding_metadata()
+        else:
+            from .shardings import propagation_rules as _propagation_rules
+
+            _propagation_rules.set_strategy_seed(
+                self.strategy_seed, self.strategy_radius
+            )
+            reset_placement_options_cache()
+            try:
+                self.strats = self.build_sharding_metadata()
+            finally:
+                _propagation_rules.set_strategy_seed(None, None)
+                set_current_seed_node(None)
+                reset_placement_options_cache()
         t_strategy = time.perf_counter() - t0
         self.profile["timings"]["strategy_enumeration_s"] = t_strategy
         logger.info("ShardingOptimizer: strategy enumeration took %.3fs", t_strategy)
@@ -398,6 +419,7 @@ class ShardingOptimizer:
         # _skip_enumeration_redistribute_cost).
         with _skip_enumeration_redistribute_cost(self.fast_build):
             for node in self.graph.nodes:
+                set_current_seed_node(node.name)
                 if node.op in ("placeholder", "get_attr"):
                     val = node.meta.get("val")
                     if isinstance(val, torch.Tensor):
@@ -445,6 +467,7 @@ class ShardingOptimizer:
                     strats[node] = user_strats
                 else:
                     raise ValueError(f"Unexpected node op: {node.op}")
+        set_current_seed_node(None)
         return strats
 
     def create_cluster_links(self, clusters):
