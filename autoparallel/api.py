@@ -237,7 +237,7 @@ class AutoParallel:
     """
 
     # Selectable solvers over the eagerly built optimizer problem.
-    SOLVER_CHOICES = ("ilp", "lp")
+    SOLVER_CHOICES = ("ilp", "approx", "lp")
 
     def __init__(
         self,
@@ -415,6 +415,7 @@ class AutoParallel:
         self,
         verbose=True,
         solver=None,
+        approximate_options=None,
         optimality_check=False,
     ):
         """Solve for the optimal placement.
@@ -422,9 +423,12 @@ class AutoParallel:
         solver selects how the placement is solved (defaults to the solver chosen
         at AutoParallel construction):
           - "ilp":    exact PuLP/CBC solve.
+          - "approx": heuristic TRW-S ApproximateShardingSolver.
           - "lp":     solve the LP relaxation and use it directly. This problem is
             empirically integral, so the relaxation optimum equals the ILP optimum
             while skipping branch-and-bound; raises if it comes out fractional.
+        approximate_options is forwarded as kwargs to the approximate solver
+        (e.g. candidate_limit, max_sweeps).
 
         optimality_check: after solving, solve the LP relaxation as a lower bound
         and log the certified gap of the achieved objective from the optimum.
@@ -435,7 +439,12 @@ class AutoParallel:
             solver = self.solver
 
         opt = self.sharding_optimizer
-        if solver == "ilp":
+        if solver in ("approx", "approximate"):
+            from .approximate_sharding import ApproximateShardingSolver
+
+            approx = ApproximateShardingSolver(opt, **(approximate_options or {}))
+            self.sharding_placement = approx.get_solution(verbose=verbose)
+        elif solver == "ilp":
             self.sharding_placement = opt.get_solution(verbose=False)
         elif solver in ("lp", "lp_relax", "lp_relaxation"):
             opt._set_objective()
