@@ -236,7 +236,9 @@ class AutoParallel:
         fast_build: Skip DTensor enumeration costs that AutoParallel recomputes.
     """
 
-    # Selectable solvers over the eagerly built optimizer problem.
+    # Selectable solvers. "ilp": exact PuLP/CBC. "approx": heuristic TRW-S
+    # (light build, no PuLP). "lp": LP relaxation used directly as the solve
+    # (empirically integral for this problem, so much cheaper than CBC).
     SOLVER_CHOICES = ("ilp", "approx", "lp")
 
     def __init__(
@@ -251,8 +253,15 @@ class AutoParallel:
         repeated_subgraphs: bool = True,
         fast_build: bool = True,
         solver: str = "ilp",
+        lazy_costs: Optional[bool] = None,
     ):
         self.stack = ExitStack()
+        # The solver chosen here decides how the optimizer is built: "ilp"/"lp"
+        # build the full PuLP problem (CBC exact solve / LP relaxation solve);
+        # "approx" builds a lighter optimizer (no PuLP variables/constraints),
+        # much faster to construct, solved heuristically. optimize_placement(
+        # solver=...) may override the solve as long as it is compatible with
+        # this build.
         if solver not in self.SOLVER_CHOICES:
             raise ValueError(
                 f"Unknown solver={solver!r}; expected one of {self.SOLVER_CHOICES}"
@@ -269,6 +278,10 @@ class AutoParallel:
         self.cost_model = cost_model
         self.repeated_subgraphs = repeated_subgraphs
         self.fast_build = fast_build
+        # None => default per solver: approx builds lazy (no eager per-edge cost
+        # estimation; the TRW-S solver computes costs on demand), ilp/lp build
+        # eager (a PuLP objective needs the costs). True/False forces lazy/eager.
+        self.lazy_costs = lazy_costs
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
@@ -336,6 +349,12 @@ class AutoParallel:
                 force_grad_reduce_in_higher_precision,
                 repeated_subgraphs=self.repeated_subgraphs,
                 fast_build=self.fast_build,
+                build_pulp=self.solver in ("ilp", "lp"),
+                build_costs=(
+                    (self.solver != "approx")
+                    if self.lazy_costs is None
+                    else (not self.lazy_costs)
+                ),
             )
 
             self.sharding_optimizer = sharding_optimizer
@@ -423,12 +442,15 @@ class AutoParallel:
         solver selects how the placement is solved (defaults to the solver chosen
         at AutoParallel construction):
           - "ilp":    exact PuLP/CBC solve.
-          - "approx": heuristic TRW-S ApproximateShardingSolver.
+          - "approx": heuristic TRW-S ApproximateShardingSolver — trades a small
+            objective gap for a much faster solve.
           - "lp":     solve the LP relaxation and use it directly. This problem is
             empirically integral, so the relaxation optimum equals the ILP optimum
             while skipping branch-and-bound; raises if it comes out fractional.
         approximate_options is forwarded as kwargs to the approximate solver
-        (e.g. candidate_limit, max_sweeps).
+        (e.g. candidate_limit, max_sweeps). The requested solver must be
+        compatible with how the optimizer was built: "ilp"/"lp" need a PuLP
+        problem (build with solver="ilp" or "lp").
 
         optimality_check: after solving, solve the LP relaxation as a lower bound
         and log the certified gap of the achieved objective from the optimum.
@@ -445,8 +467,20 @@ class AutoParallel:
             approx = ApproximateShardingSolver(opt, **(approximate_options or {}))
             self.sharding_placement = approx.get_solution(verbose=verbose)
         elif solver == "ilp":
+            if opt.prob is None:
+                raise RuntimeError(
+                    "solver='ilp' requires a PuLP problem, but this AutoParallel "
+                    "was constructed without one (e.g. solver='approx'). "
+                    "Construct with solver='ilp' to use the exact solver."
+                )
             self.sharding_placement = opt.get_solution(verbose=False)
         elif solver in ("lp", "lp_relax", "lp_relaxation"):
+            if opt.prob is None:
+                raise RuntimeError(
+                    "solver='lp' requires a PuLP problem, but this AutoParallel "
+                    "was constructed without one (e.g. solver='approx'). "
+                    "Construct with solver='lp' or 'ilp' to use the LP solver."
+                )
             opt._set_objective()
             res = opt.solve_lp_relaxation(verbose=verbose, extract=True)
             if res["solution"] is None:

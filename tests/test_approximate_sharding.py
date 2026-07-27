@@ -214,3 +214,32 @@ def test_approx_respects_input_output_constraints():
         }
         assert x_sharding in placements
         assert out_sharding in placements
+
+
+@apply_cuda_patches
+@pytest.mark.filterwarnings("ignore:Constructing LpVariable")
+def test_lite_build_matches_full():
+    """Building with solver="approx" skips PuLP variables/constraints (faster
+    setup); the resulting assignment must be byte-identical to running the
+    approximate solver on a full PuLP build."""
+    mesh = _fake_2d_mesh()
+
+    with _tiny_llama3_autop(mesh, solver="ilp") as autop:
+        _add_constraints(autop, mesh)
+        assert autop.sharding_optimizer.prob is not None
+        autop.optimize_placement(verbose=False, solver="approx")
+        obj_full = autop.sharding_optimizer.profile["approximate"]["objective"]
+        keys_full = set(autop.sharding_optimizer.selected_keys)
+
+    with _tiny_llama3_autop(mesh, solver="approx") as autop:
+        _add_constraints(autop, mesh)
+        # Lite build: no PuLP problem or variables were constructed.
+        assert autop.sharding_optimizer.prob is None
+        assert not autop.sharding_optimizer.pulp_variables
+        solution = autop.optimize_placement(verbose=False)
+        obj_lite = autop.sharding_optimizer.profile["approximate"]["objective"]
+        keys_lite = set(autop.sharding_optimizer.selected_keys)
+        assert solution
+
+    assert obj_lite == pytest.approx(obj_full, rel=1e-9)
+    assert keys_lite == keys_full
