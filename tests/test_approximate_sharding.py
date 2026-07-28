@@ -138,6 +138,7 @@ def test_lp_solver_matches_ilp():
 
         autop.optimize_placement(verbose=False, solver="lp")
         lp_objective = pulp.value(opt.prob.objective)
+        assert all(var.value() in (0.0, 1.0) for var in opt.pulp_variables.values())
         violated = [n for n, c in opt.prob.constraints.items() if not c.valid()]
         assert not violated, f"lp violated {len(violated)} constraints"
 

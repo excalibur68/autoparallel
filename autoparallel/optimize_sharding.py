@@ -1253,10 +1253,24 @@ class ShardingOptimizer:
                     n_fractional += 1
             solution = None
             if extract and n_fractional == 0:
+                for v in variables:
+                    value = v.value()
+                    if value is not None:
+                        v.varValue = float(value > 0.5)
+                violated = [
+                    name
+                    for name, constraint in self.prob.constraints.items()
+                    if not constraint.valid(frac_tol)
+                ]
+                if violated:
+                    raise RuntimeError(
+                        "Integral LP solution is infeasible after rounding; "
+                        f"violated constraints: {violated}"
+                    )
                 self.selected_keys = [
                     key
                     for key, dv in self.decision_vars.items()
-                    if dv.var.value() is not None and dv.var.value() > 0.5
+                    if dv.var.value() == 1.0
                 ]
                 for root_key in list(self.selected_keys):
                     self.selected_keys.extend(self._linked_option_keys(root_key))
