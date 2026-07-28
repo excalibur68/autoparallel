@@ -376,7 +376,9 @@ def _restore_solution(opt, selected_keys_by_name, nodes_by_name):
         for argi, out_idx, inp_idx in key_parts:
             opt.selected_keys.append((node_idx, argi, out_idx, inp_idx))
 
-    # Set PuLP variable values: selected = 1.0, all others default to 0.0
+    # Set PuLP variable values: selected = 1.0, all others = 0.0.
+    for var in opt.pulp_variables.values():
+        var.varValue = 0.0
     selected_set = set(opt.selected_keys)
     for key in selected_set:
         dv = opt.decision_vars.get(key)
@@ -386,6 +388,9 @@ def _restore_solution(opt, selected_keys_by_name, nodes_by_name):
     # Expand cluster links
     for root_key in list(opt.selected_keys):
         opt.selected_keys.extend(opt._linked_option_keys(root_key))
+
+    opt.prob.status = pulp.LpStatusOptimal
+    opt.prob.sol_status = pulp.LpSolutionOptimal
 
 
 def save_placements(opt, path):
