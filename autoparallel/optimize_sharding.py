@@ -1676,7 +1676,7 @@ class ShardingOptimizer:
     # ---- Serialization ----
 
     def save(self, path):
-        """Save the full optimizer state for later interactive exploration."""
+        """Save the full ILP/LP optimizer state for interactive exploration."""
         from autoparallel.serialization import save_optimizer
 
         save_optimizer(self, path)
