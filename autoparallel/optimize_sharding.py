@@ -159,6 +159,32 @@ def _get_flex_local_map_cost_hint(node, out_idx):
     return float(alternatives[out_idx].get("cost_hint", 0.0))
 
 
+def _freeze_flex_local_map_contract(value):
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_flex_local_map_contract(item) for item in value)
+    return value
+
+
+def _get_flex_local_map_contract(node):
+    kwargs = node.meta.get("local_map_kwargs", {})
+    alternatives = get_flex_local_map_alternatives(kwargs)
+    if alternatives is None:
+        return None
+    return (
+        tuple(
+            (
+                alternative.get("name"),
+                _freeze_flex_local_map_contract(alternative["in_placements"]),
+                _freeze_flex_local_map_contract(alternative["out_placements"]),
+                float(alternative.get("cost_hint", 0.0)),
+            )
+            for alternative in alternatives
+        ),
+        _freeze_flex_local_map_contract(kwargs.get("in_grad_placements")),
+        bool(kwargs.get("redistribute_inputs", False)),
+    )
+
+
 def _produces_tensor(val):
     """Check if a node's meta value represents tensor output(s)."""
     if isinstance(val, torch.Tensor):
@@ -372,6 +398,14 @@ class ShardingOptimizer:
             cluster0 = cluster_group[0]
             for cluster_i in cluster_group[1:]:
                 for n0, ni in zip(cluster0, cluster_i):
+                    contract0 = _get_flex_local_map_contract(n0)
+                    contracti = _get_flex_local_map_contract(ni)
+                    if contract0 != contracti:
+                        raise RuntimeError(
+                            "Repeated subgraph local_map nodes must declare the same "
+                            f"flex alternatives: {n0} has {contract0}, {ni} has "
+                            f"{contracti}"
+                        )
                     idx0 = self.node_map[n0]
                     idx1 = self.node_map[ni]
                     options_n0 = list(self.walk_over_options(n0))

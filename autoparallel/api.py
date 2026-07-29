@@ -411,7 +411,6 @@ class AutoParallel:
         self._assert_entered()
 
         self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
-        finalize_flex_local_maps(self.gm, self.sharding_placement, self.mesh)
 
         if verbose:
             logger.info(self.sharding_optimizer.get_log(verbose=True))
@@ -451,6 +450,7 @@ class AutoParallel:
     def _apply_placement_common(self, sharding_placement):
         t0 = time.perf_counter()
         self._assert_entered()
+        finalize_flex_local_maps(self.gm, sharding_placement, self.mesh)
 
         # TODO: what kind of updates do we have to do?
         #  - graph obvs
