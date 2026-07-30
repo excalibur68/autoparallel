@@ -10,7 +10,8 @@ from typing import Optional
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.distributed.tensor.placement_types import Shard
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -22,10 +23,21 @@ from autoparallel._testing.models.dsv3 import (
     make_dsv3_config,
 )
 from autoparallel.api import AutoParallel
-from autoparallel.collectives import flex_local_map, get_flex_local_map_alternatives
+from autoparallel.collectives import (
+    all_reduce,
+    flex_local_map,
+    get_flex_local_map_alternatives,
+    local_map,
+)
 from autoparallel.shardings.placement_options import NumericsLogger
 
 _DEFAULT_DTENSOR_RNG_SEED = 0
+_LOCAL_MAP_CASES = (
+    "plain-sharded",
+    "plain-replicated-counts",
+    "flex-default",
+    "flex-replicated-counts",
+)
 
 
 def _seed_dtensor_rng(rng_seed: Optional[int]) -> None:
@@ -40,13 +52,12 @@ def _moe_implementation_1(
     experts_w3,
     experts_w2,
     out,
-    *,
     top_k,
     num_experts,
     score_before_experts,
     axis_name,
 ):
-    return local_mapped_region(
+    out, tokens_per_expert = local_mapped_region(
         x,
         selected_experts_indices,
         top_scores,
@@ -59,6 +70,7 @@ def _moe_implementation_1(
         score_before_experts,
         axis_name,
     )
+    return out, all_reduce(tokens_per_expert, axis_name)
 
 
 def _moe_implementation_2(
@@ -94,38 +106,49 @@ def _unused_default_moe_implementation(*args):
     raise AssertionError("flex_local_map alternatives must provide their own fn")
 
 
+def _replicated_counts_moe_local_map_kwargs(mesh):
+    kwargs = _moe_local_map_kwargs(mesh)
+    return {
+        **kwargs,
+        "out_placements": (
+            kwargs["out_placements"][0],
+            (Partial(reduce_op="sum"), Replicate()),
+        ),
+    }
+
+
 class _FlexMoELocalMap(torch.nn.Module):
-    def __init__(self, moe, mesh):
+    def __init__(self, moe, mesh, selected_index):
         super().__init__()
-        local_map_kwargs = _moe_local_map_kwargs(mesh)
+        sharded_kwargs = _moe_local_map_kwargs(mesh)
+        replicated_counts_kwargs = _replicated_counts_moe_local_map_kwargs(mesh)
         static_kwargs = {
             "top_k": moe.router.top_k,
             "num_experts": moe.router.num_experts,
             "score_before_experts": moe.score_before_experts,
             "axis_name": moe.axis_name,
         }
-        in_placements = local_map_kwargs["in_placements"][:7]
+        high_cost = 1_000_000.0
         self.mapped_region = flex_local_map(
             _unused_default_moe_implementation,
             alternatives=[
                 {
-                    "name": "moe_implementation_2",
+                    "name": "sharded_ep_boundary",
                     "fn": partial(_moe_implementation_2, **static_kwargs),
-                    "in_placements": in_placements,
-                    "out_placements": local_map_kwargs["out_placements"],
-                    "cost_hint": 10.0,
+                    "in_placements": sharded_kwargs["in_placements"][:7],
+                    "out_placements": sharded_kwargs["out_placements"],
+                    "cost_hint": 0.0 if selected_index == 0 else high_cost,
                 },
                 {
-                    "name": "moe_implementation_1",
+                    "name": "replicated_counts_boundary",
                     "fn": partial(_moe_implementation_1, **static_kwargs),
-                    "in_placements": in_placements,
-                    "out_placements": local_map_kwargs["out_placements"],
-                    "cost_hint": 0.0,
+                    "in_placements": replicated_counts_kwargs["in_placements"][:7],
+                    "out_placements": replicated_counts_kwargs["out_placements"],
+                    "cost_hint": 0.0 if selected_index == 1 else high_cost,
                 },
             ],
-            in_grad_placements=local_map_kwargs["in_grad_placements"],
             device_mesh=mesh,
-            redistribute_inputs=local_map_kwargs["redistribute_inputs"],
+            redistribute_inputs=sharded_kwargs["redistribute_inputs"],
         )
 
     def forward(
@@ -153,17 +176,39 @@ class _FlexMoELocalMap(torch.nn.Module):
         )
 
 
-def _enable_flex_local_map(model, mesh):
+def _enable_flex_local_map(model, mesh, selected_index):
     for module in list(model.modules()):
         if isinstance(module, MoE):
-            module.local_mapped_region = _FlexMoELocalMap(module, mesh)
+            module.local_mapped_region = _FlexMoELocalMap(module, mesh, selected_index)
+
+
+def _enable_replicated_counts_local_map(model, mesh):
+    for module in list(model.modules()):
+        if isinstance(module, MoE):
+            module.local_mapped_region = local_map(
+                _moe_implementation_1,
+                **_replicated_counts_moe_local_map_kwargs(mesh),
+            )
+
+
+def _snapshot_tensor(value, global_tensor=False):
+    with torch.no_grad():
+        if isinstance(value, DTensor):
+            value = value.full_tensor() if global_tensor else value.to_local()
+        return value.detach().cpu()
+
+
+def _save_validation_snapshot(numerics_logger, name, value):
+    rank_dir = numerics_logger.dir / f"rank_{numerics_logger.rank}"
+    rank_dir.mkdir(exist_ok=True)
+    torch.save(value, rank_dir / name)
 
 
 def run_test(
     fake_evaluate: bool,
     rng_seed: Optional[int],
     logs_dir: str,
-    use_flex_local_map: bool,
+    local_map_case: str,
 ):
     # Match TorchTitan's DeepSeek V3 debug model shape. This example is a
     # regression guard for placement/clustering issues that only appear at the
@@ -220,8 +265,12 @@ def run_test(
             mesh=mesh,
             compute_dtype=torch.bfloat16,
         )
-    if use_flex_local_map:
-        _enable_flex_local_map(model, mesh)
+    if local_map_case == "plain-replicated-counts":
+        _enable_replicated_counts_local_map(model, mesh)
+    elif local_map_case == "flex-default":
+        _enable_flex_local_map(model, mesh, selected_index=0)
+    elif local_map_case == "flex-replicated-counts":
+        _enable_flex_local_map(model, mesh, selected_index=1)
 
     def input_fn():
         return torch.randint(
@@ -254,19 +303,55 @@ def run_test(
             if get_flex_local_map_alternatives(node.meta.get("local_map_kwargs", {}))
             is not None
         ]
-        assert bool(flex_nodes) == use_flex_local_map
+        selected_index = {
+            "flex-default": 0,
+            "flex-replicated-counts": 1,
+        }.get(local_map_case)
+        assert bool(flex_nodes) == (selected_index is not None)
         sharding_placement = autop.optimize_placement(verbose=False)
-        if use_flex_local_map:
+        if selected_index is not None:
             for node in flex_nodes:
                 spec = sharding_placement[node]
-                assert spec.flex_local_map_alternative_index == 1
-                assert spec.flex_local_map_alternative_name == "moe_implementation_1"
+                assert spec.flex_local_map_alternative_index == selected_index
+                assert spec.flex_local_map_alternative_name == (
+                    "sharded_ep_boundary"
+                    if selected_index == 0
+                    else "replicated_counts_boundary"
+                )
         parallel_mod = autop.apply_placement(sharding_placement)
 
     parallel_mod.to_empty(device=device)
     parallel_mod.init_weights(buffer_device=device, seed=rng_seed)
     if rng_seed is not None:
         numerics_logger.log_model_weights(parallel_mod)
+        _save_validation_snapshot(
+            numerics_logger,
+            "model_state.pt",
+            {
+                **{
+                    f"parameter:{name}": _snapshot_tensor(value)
+                    for name, value in parallel_mod.named_parameters()
+                },
+                **{
+                    f"buffer:{name}": _snapshot_tensor(value)
+                    for name, value in parallel_mod.named_buffers()
+                },
+            },
+        )
+        _save_validation_snapshot(
+            numerics_logger,
+            "global_model_state.pt",
+            {
+                **{
+                    f"parameter:{name}": _snapshot_tensor(value, global_tensor=True)
+                    for name, value in parallel_mod.named_parameters()
+                },
+                **{
+                    f"buffer:{name}": _snapshot_tensor(value, global_tensor=True)
+                    for name, value in parallel_mod.named_buffers()
+                },
+            },
+        )
         torch.manual_seed(rng_seed)
 
     n_microbatches = 16
@@ -281,6 +366,9 @@ def run_test(
     if rng_seed:
         numerics_logger.log_diff(
             full_batch.to(torch.float32), prefix="full batch input"
+        )
+        _save_validation_snapshot(
+            numerics_logger, "full_batch.pt", full_batch.detach().cpu()
         )
 
     with torch.autograd.set_multithreading_enabled(False):
@@ -301,10 +389,42 @@ def run_test(
                 out.backward(torch.ones_like(out))
                 if rng_seed is not None:
                     numerics_logger.log_diff(out, prefix=f"mb{i} fwd out")
+                    _save_validation_snapshot(
+                        numerics_logger,
+                        f"mb{i}_output.pt",
+                        _snapshot_tensor(out),
+                    )
 
             if rng_seed is not None:
+                gradients = {}
                 for k, v in parallel_mod.named_parameters():
                     numerics_logger.log_diff(v.grad, prefix=f"grad {k}")
+                    gradients[k] = _snapshot_tensor(v.grad)
+                _save_validation_snapshot(numerics_logger, "gradients.pt", gradients)
+                _save_validation_snapshot(
+                    numerics_logger,
+                    "global_gradients.pt",
+                    {
+                        name: _snapshot_tensor(value.grad, global_tensor=True)
+                        for name, value in parallel_mod.named_parameters()
+                    },
+                )
+                _save_validation_snapshot(
+                    numerics_logger,
+                    "final_buffers.pt",
+                    {
+                        name: _snapshot_tensor(value)
+                        for name, value in parallel_mod.named_buffers()
+                    },
+                )
+                _save_validation_snapshot(
+                    numerics_logger,
+                    "global_final_buffers.pt",
+                    {
+                        name: _snapshot_tensor(value, global_tensor=True)
+                        for name, value in parallel_mod.named_buffers()
+                    },
+                )
 
     print("All good!")
 
@@ -342,16 +462,30 @@ if __name__ == "__main__":
     parser.add_argument(
         "--flex-local-map",
         action="store_true",
-        help="Use two explicit MoE flex_local_map implementations.",
+        help="Compatibility alias for --local-map-case flex-replicated-counts.",
+    )
+    parser.add_argument(
+        "--local-map-case",
+        choices=_LOCAL_MAP_CASES,
+        default=None,
+        help="Select the MoE local_map boundary and flex alternative.",
     )
     args = parser.parse_args()
 
     if args.rng_seed is not None:
         torch.use_deterministic_algorithms(True)
 
+    if args.flex_local_map and args.local_map_case is not None:
+        parser.error("--flex-local-map and --local-map-case cannot be used together")
+    local_map_case = (
+        "flex-replicated-counts"
+        if args.flex_local_map
+        else (args.local_map_case or "plain-sharded")
+    )
+
     run_test(
         fake_evaluate=args.fake_evaluate,
         rng_seed=args.rng_seed,
         logs_dir=args.logs_dir,
-        use_flex_local_map=args.flex_local_map,
+        local_map_case=local_map_case,
     )

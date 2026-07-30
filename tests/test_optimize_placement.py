@@ -3,15 +3,24 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections import Counter
+
 import pytest
 import torch
 import torch.nn.functional as F
 from conftest import apply_cuda_patches
 from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_nodes
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
+from torch.distributed.tensor.placement_types import (
+    Partial,
+    Placement,
+    Replicate,
+    Shard,
+)
 
+from autoparallel._flex_local_map import _body
 from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.collectives import (
     flex_local_map,
@@ -535,7 +544,7 @@ def _make_flex_pointwise(
 
 
 class FlexLocalMapDifferentActivations(nn.Module):
-    def __init__(self, mesh):
+    def __init__(self, mesh, cost_hints=(100.0, 0.0)):
         super().__init__()
         self.scale = nn.Parameter(torch.empty(()))
         placements = ((Replicate(),),)
@@ -544,10 +553,34 @@ class FlexLocalMapDifferentActivations(nn.Module):
             _flex_clone_body,
             _flex_where_identity_body,
             placements,
+            cost_hints=cost_hints,
         )
 
     def forward(self, x):
         return self.pointwise(x * self.scale)[0]
+
+
+def _flex_two_differentiable_outputs(x):
+    return x.clone(), torch.sin(x)
+
+
+def _flex_one_differentiable_output(x):
+    return x.clone(), x.detach().clone()
+
+
+class FlexLocalMapChangedDifferentiableOutputs(nn.Module):
+    def __init__(self, mesh):
+        super().__init__()
+        placements = ((Replicate(),), (Replicate(),))
+        self.pointwise = _make_flex_pointwise(
+            mesh,
+            _flex_two_differentiable_outputs,
+            _flex_one_differentiable_output,
+            placements,
+        )
+
+    def forward(self, x):
+        return self.pointwise(x)
 
 
 class FlexLocalMapMultiOutput(nn.Module):
@@ -646,21 +679,294 @@ class FlexLocalMapDifferentPlacements(nn.Module):
         return self.pointwise(x)[0]
 
 
+class PlainLocalMapReference(nn.Module):
+    def __init__(
+        self,
+        mesh,
+        fn,
+        input_placement,
+        output_placements,
+        *,
+        use_scale=False,
+        unwrap_single=False,
+    ):
+        super().__init__()
+        self.scale = nn.Parameter(torch.empty(())) if use_scale else None
+        self.unwrap_single = unwrap_single
+        self.pointwise = local_map(
+            fn,
+            in_placements=(input_placement,),
+            out_placements=output_placements,
+            device_mesh=mesh,
+            redistribute_inputs=True,
+        )
+
+    def forward(self, x):
+        if self.scale is not None:
+            x = x * self.scale
+        output = self.pointwise(x)
+        return output[0] if self.unwrap_single else output
+
+
+def _canonical_target(target):
+    if isinstance(target, str):
+        return target
+    name = getattr(target, "name", None)
+    if callable(name):
+        try:
+            return name()
+        except TypeError:
+            pass
+    module = getattr(target, "__module__", None)
+    qualname = getattr(target, "__qualname__", None)
+    if module is not None and qualname is not None:
+        return f"{module}.{qualname}"
+    return str(target)
+
+
+def _canonical_tensor(value):
+    return (
+        "tensor",
+        tuple(int(dim) if isinstance(dim, int) else str(dim) for dim in value.shape),
+        str(value.dtype),
+        tuple(int(dim) for dim in value.stride()),
+        value.requires_grad,
+        value.device.type,
+    )
+
+
+def _canonical_local_map_kwargs(kwargs):
+    keys = (
+        "in_placements",
+        "out_placements",
+        "in_grad_placements",
+        "redistribute_inputs",
+        "device_mesh",
+    )
+    return tuple(
+        (key, _canonical_value(kwargs.get(key))) for key in keys if key in kwargs
+    )
+
+
+def _canonical_value(value):
+    if isinstance(value, torch.Tensor):
+        return _canonical_tensor(value)
+    if isinstance(value, torch.fx.GraphModule):
+        return _canonical_graph_signature(value)
+    if isinstance(value, DeviceMesh):
+        return (
+            "device_mesh",
+            value.device_type,
+            tuple(value.shape),
+            tuple(value.mesh_dim_names) if value.mesh_dim_names is not None else None,
+        )
+    if isinstance(value, Placement):
+        return (type(value).__name__, repr(value))
+    if isinstance(value, dict):
+        return tuple(
+            (str(key), _canonical_value(item))
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        )
+    if isinstance(value, tuple):
+        return ("tuple", tuple(_canonical_value(item) for item in value))
+    if isinstance(value, list):
+        return ("list", tuple(_canonical_value(item) for item in value))
+    if isinstance(value, slice):
+        return (
+            "slice",
+            _canonical_value(value.start),
+            _canonical_value(value.stop),
+            _canonical_value(value.step),
+        )
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    if isinstance(value, (torch.dtype, torch.device, torch.layout)):
+        return str(value)
+    if callable(value):
+        return ("callable", _canonical_target(value))
+    return (type(value).__name__, repr(value))
+
+
+def _canonical_arg(value, node_signatures):
+    if isinstance(value, torch.fx.Node):
+        return ("node", node_signatures[value])
+    if isinstance(value, tuple):
+        return ("tuple", tuple(_canonical_arg(item, node_signatures) for item in value))
+    if isinstance(value, list):
+        return ("list", tuple(_canonical_arg(item, node_signatures) for item in value))
+    if isinstance(value, dict):
+        return tuple(
+            (str(key), _canonical_arg(item, node_signatures))
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        )
+    if isinstance(value, slice):
+        return (
+            "slice",
+            _canonical_arg(value.start, node_signatures),
+            _canonical_arg(value.stop, node_signatures),
+            _canonical_arg(value.step, node_signatures),
+        )
+    return _canonical_value(value)
+
+
+def _fetch_attr(module, target):
+    value = module
+    for atom in target.split("."):
+        value = getattr(value, atom)
+    return value
+
+
+def _canonical_meta(meta):
+    result = []
+    if "local_map_kwargs" in meta:
+        result.append(
+            (
+                "local_map_kwargs",
+                _canonical_local_map_kwargs(meta["local_map_kwargs"]),
+            )
+        )
+    for key in ("num_activations", "is_backward", "partitioner_tag"):
+        if key in meta:
+            result.append((key, _canonical_value(meta[key])))
+    for key in ("example_value", "val"):
+        if key in meta:
+            result.append(("example_value", _canonical_value(meta[key])))
+            break
+    return tuple(result)
+
+
+def _canonical_graph_signature(gm):
+    node_signatures = {}
+    placeholder_index = 0
+    output_signature = None
+    for node in gm.graph.nodes:
+        if node.op == "placeholder":
+            signature = (
+                "placeholder",
+                placeholder_index,
+                _canonical_meta(node.meta),
+            )
+            placeholder_index += 1
+        elif node.op == "get_attr":
+            signature = (
+                "get_attr",
+                _canonical_value(_fetch_attr(gm, node.target)),
+                _canonical_meta(node.meta),
+            )
+        else:
+            signature = (
+                node.op,
+                _canonical_target(node.target),
+                _canonical_arg(node.args, node_signatures),
+                _canonical_arg(node.kwargs, node_signatures),
+                _canonical_meta(node.meta),
+            )
+        node_signatures[node] = signature
+        if node.op == "output":
+            output_signature = signature
+
+    counts = Counter(node_signatures.values())
+    return (
+        "graph",
+        _canonical_meta(gm.meta),
+        tuple(sorted(counts.items(), key=lambda item: repr(item[0]))),
+        output_signature,
+    )
+
+
+def _local_map_graph_signatures(gm):
+    nodes = [node for node in gm.graph.nodes if "local_map_kwargs" in node.meta]
+    forward = [
+        node for node in nodes if node.meta.get("partitioner_tag") != "is_backward"
+    ]
+    backward = [
+        node for node in nodes if node.meta.get("partitioner_tag") == "is_backward"
+    ]
+    assert len(forward) == 1
+    assert len(backward) == 1
+    return {
+        "forward": _canonical_graph_signature(_body(gm, forward[0])),
+        "backward": _canonical_graph_signature(_body(gm, backward[0])),
+    }
+
+
+def _capture_graph_signatures(
+    model,
+    input_fn,
+    mesh,
+    input_constraints,
+    output_constraints,
+    *,
+    force_flex_alternative=None,
+):
+    with AutoParallel(model, input_fn, mesh) as autop:
+        autop.add_input_constraints(input_constraints)
+        autop.add_output_constraints(output_constraints)
+        initial_bodies = _local_map_graph_signatures(autop.gm)
+        solution = autop.optimize_placement()
+        if force_flex_alternative is not None:
+            forward = next(
+                node
+                for node in autop.gm.graph.nodes
+                if get_flex_local_map_alternatives(
+                    node.meta.get("local_map_kwargs", {})
+                )
+                is not None
+                and node.meta.get("partitioner_tag") != "is_backward"
+            )
+            autop.sharding_optimizer.add_node_constraint(
+                forward, placement=input_constraints[0]
+            )
+            solution = autop.sharding_optimizer.resolve()
+        if force_flex_alternative is not None:
+            selected = {
+                spec.flex_local_map_alternative_index
+                for node, spec in solution.items()
+                if get_flex_local_map_alternatives(
+                    node.meta.get("local_map_kwargs", {})
+                )
+                is not None
+            }
+            assert selected == {force_flex_alternative}
+        autop.apply_placement(solution)
+        bodies = _local_map_graph_signatures(autop.gm)
+        return {
+            **bodies,
+            "initial_forward": initial_bodies["forward"],
+            "joint": _canonical_graph_signature(autop.gm),
+            "parallel": _canonical_graph_signature(autop.parallel_gm),
+        }
+
+
 @apply_cuda_patches
-def test_flex_local_map_selected_body_forward_backward(device_mesh_1d, device="cuda"):
+@pytest.mark.parametrize(
+    ("cost_hints", "expected_index"),
+    (((0.0, 100.0), 0), ((100.0, 0.0), 1)),
+)
+def test_flex_local_map_selected_body_forward_backward(
+    device_mesh_1d, cost_hints, expected_index, device="cuda"
+):
     shape = (512, 128)
 
     def input_fn():
         return torch.randn(*shape, device=device, requires_grad=True)
 
     with torch.device("meta"):
-        model = FlexLocalMapDifferentActivations(device_mesh_1d)
+        model = FlexLocalMapDifferentActivations(device_mesh_1d, cost_hints)
 
     with AutoParallel(model, input_fn, device_mesh_1d) as autop:
         replicated = (Replicate(),)
         autop.add_input_constraints([replicated])
         autop.add_output_constraints([replicated])
-        parallel_model = autop.apply_placement(autop.optimize_placement())
+        solution = autop.optimize_placement()
+        selected = {
+            spec.flex_local_map_alternative_index
+            for node, spec in solution.items()
+            if get_flex_local_map_alternatives(node.meta.get("local_map_kwargs", {}))
+            is not None
+        }
+        assert selected == {expected_index}
+        parallel_model = autop.apply_placement(solution)
 
     parallel_model.to_empty(device=device)
     with torch.no_grad():
@@ -678,6 +984,56 @@ def test_flex_local_map_selected_body_forward_backward(device_mesh_1d, device="c
     torch.testing.assert_close(
         parallel_model.scale.grad.to_local(), expected_scale.grad
     )
+
+
+@apply_cuda_patches
+def test_flex_local_map_apply_requires_selected_alternative(
+    device_mesh_1d, device="cuda"
+):
+    shape = (512, 128)
+
+    def input_fn():
+        return torch.randn(*shape, device=device, requires_grad=True)
+
+    with torch.device("meta"):
+        model = FlexLocalMapDifferentActivations(device_mesh_1d)
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        replicated = (Replicate(),)
+        autop.add_input_constraints([replicated])
+        autop.add_output_constraints([replicated])
+        solution = autop.optimize_placement()
+        forward = next(
+            node
+            for node in solution
+            if get_flex_local_map_alternatives(node.meta.get("local_map_kwargs", {}))
+            is not None
+            and node.meta.get("partitioner_tag") != "is_backward"
+        )
+        del solution[forward].flex_local_map_alternative_index
+        with pytest.raises(RuntimeError, match="has no selected alternative"):
+            autop.apply_placement(solution)
+
+
+@apply_cuda_patches
+def test_flex_local_map_rejects_changed_differentiable_outputs(
+    device_mesh_1d, device="cuda"
+):
+    shape = (512, 128)
+
+    def input_fn():
+        return torch.randn(*shape, device=device, requires_grad=True)
+
+    with torch.device("meta"):
+        model = FlexLocalMapChangedDifferentiableOutputs(device_mesh_1d)
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        replicated = (Replicate(),)
+        autop.add_input_constraints([replicated])
+        autop.add_output_constraints([replicated, replicated])
+        solution = autop.optimize_placement()
+        with pytest.raises(RuntimeError, match="changed its differentiable outputs"):
+            autop.apply_placement(solution)
 
 
 @apply_cuda_patches
@@ -848,6 +1204,76 @@ def test_flex_local_map_resolve_then_apply_different_placements(
     expected.sum().backward()
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(actual_input.grad, expected_input.grad)
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize(
+    "case", ("same_boundary", "different_boundary", "nondifferentiable_output")
+)
+def test_flex_local_map_grafted_graph_matches_direct_trace(
+    device_mesh_1d, case, device="cuda"
+):
+    shape = (512, 128)
+
+    def input_fn():
+        return torch.randn(*shape, device=device, requires_grad=True)
+
+    replicated = (Replicate(),)
+    sharded = (Shard(0),)
+    with torch.device("meta"):
+        if case == "same_boundary":
+            flex_model = FlexLocalMapDifferentActivations(device_mesh_1d)
+            direct_model = PlainLocalMapReference(
+                device_mesh_1d,
+                _flex_where_identity_body,
+                replicated,
+                (replicated,),
+                use_scale=True,
+                unwrap_single=True,
+            )
+            input_constraints = [replicated]
+            output_constraints = [replicated]
+        elif case == "different_boundary":
+            flex_model = FlexLocalMapDifferentPlacements(device_mesh_1d)
+            direct_model = PlainLocalMapReference(
+                device_mesh_1d,
+                _flex_shifted_cos_body,
+                sharded,
+                (sharded,),
+                unwrap_single=True,
+            )
+            input_constraints = [sharded]
+            output_constraints = [sharded]
+        else:
+            flex_model = FlexLocalMapMultiOutput(device_mesh_1d)
+            direct_model = PlainLocalMapReference(
+                device_mesh_1d,
+                _flex_shifted_cos_with_detached_body,
+                replicated,
+                (replicated, replicated),
+            )
+            input_constraints = [replicated]
+            output_constraints = [replicated, replicated]
+
+    flex_signatures = _capture_graph_signatures(
+        flex_model,
+        input_fn,
+        device_mesh_1d,
+        input_constraints,
+        output_constraints,
+        force_flex_alternative=1,
+    )
+    direct_signatures = _capture_graph_signatures(
+        direct_model,
+        input_fn,
+        device_mesh_1d,
+        input_constraints,
+        output_constraints,
+    )
+
+    assert flex_signatures["initial_forward"] != direct_signatures["forward"]
+    for graph in ("forward", "backward", "joint", "parallel"):
+        assert flex_signatures[graph] == direct_signatures[graph], graph
 
 
 class FlexLocalMapTransformerBlock(nn.Module):
