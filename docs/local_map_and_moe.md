@@ -367,28 +367,41 @@ declares several *semantically equivalent* contracts for the same region (e.g.
 MoE `DP->EP` vs `DP+TP->EP+ETP`) and lets the solver choose:
 
 ```python
-from autoparallel.collectives import flex_local_map
+from autoparallel import flex_local_map
 
 # Built OUTSIDE forward (e.g. in __init__), with an explicit device_mesh.
 self.moe = flex_local_map(
     moe_body,
     alternatives=[
-        {"name": "dp_ep", "in_placements": ..., "out_placements": ..., "cost_hint": 0.0},
-        {"name": "dp_tp_ep_etp", "in_placements": ..., "out_placements": ..., "cost_hint": 0.0},
+        {
+            "name": "dp_ep",
+            "in_placements": ...,
+            "out_placements": ...,
+        },
+        {
+            "name": "dp_tp_ep_etp",
+            "fn": moe_body_with_tp,
+            "in_placements": ...,
+            "out_placements": ...,
+            "cost_hint": 1.0,
+        },
     ],
     device_mesh=mesh,
     redistribute_inputs=True,
 )
 ```
 
-Each alternative needs `in_placements` and `out_placements`; `fn` (defaults to the
-decorated function), `name`, and `cost_hint` (added to the solver's compute cost)
-are optional. AutoParallel emits one solver strategy per alternative.
+Each alternative is a dict with required `in_placements` and `out_placements`.
+`fn` defaults to the first argument, while `name` and the non-negative `cost_hint`
+are optional. The hint is added to the solver cost; it is not a measured runtime.
+AutoParallel emits one solver strategy per alternative.
 
 Usage constraint: apply `flex_local_map` **outside** `forward` and pass an explicit
 `device_mesh`, then call the stored callable inside `forward`. The alternatives are
 carried on a tuple-subclass that Dynamo only preserves when it is a pre-existing
 (sourced) object; constructing the wrapper inside `forward` traces it as empty.
+`in_grad_placements` is reserved for parity with `local_map`; passing a non-`None`
+value currently raises `NotImplementedError`.
 
 `optimize_placement()` first selects an alternative while constraining the forward and
 backward nodes to the same index. This is the only ILP solve. It then captures the

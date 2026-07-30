@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
+import math
 from collections.abc import Callable, Sequence
 from typing import Any, Optional, Tuple
 
@@ -56,22 +57,58 @@ def _normalize_flex_local_map_alternatives(
     default_fn: Callable,
     alternatives: Sequence[dict[str, Any]],
 ):
-    assert len(alternatives) > 0, "flex_local_map requires at least one alternative"
+    if not alternatives:
+        raise ValueError("flex_local_map requires at least one alternative")
 
     normalized = []
     for idx, alternative in enumerate(alternatives):
+        if not isinstance(alternative, dict):
+            raise TypeError(
+                f"flex_local_map alternative {idx} must be a dict, got "
+                f"{type(alternative).__name__}"
+            )
+        for key in ("in_placements", "out_placements"):
+            if key not in alternative:
+                raise ValueError(f"flex_local_map alternative {idx} requires {key}")
+            if alternative[key] is None:
+                raise ValueError(
+                    f"flex_local_map alternative {idx} {key} must not be None"
+                )
+
         fn = alternative.get("fn", default_fn)
-        assert fn is not None, "flex_local_map alternative fn must not be None"
-        assert "in_placements" in alternative
-        assert "out_placements" in alternative
+        if not callable(fn):
+            raise TypeError(f"flex_local_map alternative {idx} fn must be callable")
+        try:
+            cost_hint = float(alternative.get("cost_hint", 0.0))
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                f"flex_local_map alternative {idx} cost_hint must be a number"
+            ) from error
+        if not math.isfinite(cost_hint) or cost_hint < 0:
+            raise ValueError(
+                f"flex_local_map alternative {idx} cost_hint must be finite and "
+                "non-negative"
+            )
         normalized.append(
             {
                 **alternative,
                 "fn": fn,
-                "cost_hint": float(alternative.get("cost_hint", 0.0)),
+                "cost_hint": cost_hint,
                 "name": alternative.get("name", getattr(fn, "__name__", f"alt_{idx}")),
             }
         )
+
+    input_arity = len(normalized[0]["in_placements"])
+    output_arity = len(normalized[0]["out_placements"])
+    for idx, alternative in enumerate(normalized[1:], start=1):
+        if len(alternative["in_placements"]) != input_arity:
+            raise ValueError(
+                f"flex_local_map alternative {idx} has a different input arity"
+            )
+        if len(alternative["out_placements"]) != output_arity:
+            raise ValueError(
+                f"flex_local_map alternative {idx} has a different output arity"
+            )
 
     return tuple(normalized)
 
@@ -80,8 +117,8 @@ def flex_local_map(
     func: Callable | None = None,
     *,
     alternatives: Sequence[dict[str, Any]],
+    device_mesh: DeviceMesh,
     in_grad_placements=None,
-    device_mesh: Optional[DeviceMesh] = None,
     redistribute_inputs: bool = False,
 ):
     """Like ``local_map``, but declares several placement alternatives for one region so
@@ -89,18 +126,24 @@ def flex_local_map(
 
     Each entry of ``alternatives`` is a dict with ``in_placements`` and ``out_placements``
     (required) and optional ``fn`` (defaults to ``func``), ``name``, and ``cost_hint`` (a
-    solver cost hint, default 0.0). ``in_grad_placements``, ``device_mesh`` and
-    ``redistribute_inputs`` are as in ``local_map``.
+    non-negative solver cost hint, default 0.0). ``device_mesh`` must be explicit.
+    ``in_grad_placements`` is reserved for parity with ``local_map`` but is not yet
+    supported by AutoParallel.
 
     Apply it outside ``forward`` (e.g. in ``__init__``) with an explicit ``device_mesh``,
     and call the returned callable inside ``forward``.
     """
+    if in_grad_placements is not None:
+        raise NotImplementedError(
+            "flex_local_map does not yet support in_grad_placements"
+        )
+
     if func is None:
         return functools.partial(
             flex_local_map,
             alternatives=alternatives,
-            in_grad_placements=in_grad_placements,
             device_mesh=device_mesh,
+            in_grad_placements=in_grad_placements,
             redistribute_inputs=redistribute_inputs,
         )
 

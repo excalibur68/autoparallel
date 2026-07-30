@@ -184,6 +184,89 @@ class TestFlexLocalMapPlacementOptions:
     ``test_optimize_placement.py::test_flex_local_map_alternatives_visible_to_solver``.
     """
 
+    @pytest.mark.parametrize(
+        ("alternatives", "exception", "error"),
+        (
+            ([], ValueError, "requires at least one alternative"),
+            ([None], TypeError, "must be a dict"),
+            (
+                [{"out_placements": ((Replicate(),),)}],
+                ValueError,
+                "requires in_placements",
+            ),
+            (
+                [{"in_placements": ((Replicate(),),)}],
+                ValueError,
+                "requires out_placements",
+            ),
+            (
+                [
+                    {
+                        "fn": None,
+                        "in_placements": ((Replicate(),),),
+                        "out_placements": ((Replicate(),),),
+                    }
+                ],
+                TypeError,
+                "fn must be callable",
+            ),
+            (
+                [
+                    {
+                        "in_placements": ((Replicate(),),),
+                        "out_placements": ((Replicate(),),),
+                        "cost_hint": float("inf"),
+                    }
+                ],
+                ValueError,
+                "cost_hint must be finite and non-negative",
+            ),
+        ),
+    )
+    def test_rejects_invalid_alternatives(
+        self, device_mesh_1d, alternatives, exception, error
+    ):
+        with pytest.raises(exception, match=error):
+            flex_local_map(
+                call_local_map,
+                alternatives=alternatives,
+                device_mesh=device_mesh_1d,
+            )
+
+    def test_rejects_mismatched_alternative_arity(self, device_mesh_1d):
+        with pytest.raises(ValueError, match="different input arity"):
+            flex_local_map(
+                call_local_map,
+                alternatives=[
+                    {
+                        "in_placements": ((Replicate(),),),
+                        "out_placements": ((Replicate(),),),
+                    },
+                    {
+                        "in_placements": (
+                            (Replicate(),),
+                            (Replicate(),),
+                        ),
+                        "out_placements": ((Replicate(),),),
+                    },
+                ],
+                device_mesh=device_mesh_1d,
+            )
+
+    def test_rejects_in_grad_placements(self, device_mesh_1d):
+        with pytest.raises(NotImplementedError, match="in_grad_placements"):
+            flex_local_map(
+                call_local_map,
+                alternatives=[
+                    {
+                        "in_placements": ((Replicate(),),),
+                        "out_placements": ((Replicate(),),),
+                    }
+                ],
+                device_mesh=device_mesh_1d,
+                in_grad_placements=((Replicate(),),),
+            )
+
     def test_generates_one_strategy_per_alternative(self, device_mesh_1d):
         gm, local_map_node = _make_flex_local_map_graph(
             [
