@@ -862,15 +862,16 @@ class ShardingOptimizer:
             if node_idx in self._cluster_linked_node_idxs:
                 continue
             arg_vars = {}
+            num_args = len(self.strats[node].strategies[0].input_specs)
             for argi, out_idx, inp_idx in self.walk_over_options(node):
                 key = (node_idx, argi, out_idx, inp_idx)
                 var = self.pulp_variables.get(key)
                 if var is None:  # pruned (invalid) strategy edge
                     continue
                 arg_vars.setdefault(argi, []).append(var)
-            for eqs in arg_vars.values():
+            for argi in range(num_args):
                 self.prob += (
-                    pulp.lpSum(eqs) == 1,
+                    pulp.lpSum(arg_vars.get(argi, [])) == 1,
                     self._get_next_name("unique_decision"),
                 )
 
@@ -1167,13 +1168,9 @@ class ShardingOptimizer:
 
     def _solve(self, verbose=False):
         self._apply_memory_constraint()
-        # The sharding ILP has a near-totally-unimodular (flow-like) structure:
-        # CBC's LP relaxation is naturally integral, so it solves in seconds
-        # with zero branch-and-bound. CBC's integer *preprocessing* (probing,
-        # substitutions over hundreds of thousands of binary columns) is then
-        # pure overhead — it dominates the solve. Disabling it (correctness is
-        # unaffected; CBC still does full branch-and-bound if the relaxation is
-        # fractional) makes the solve ~10x faster on large graphs.
+        # The sharding ILP is flow-like and its LP relaxation is usually integral.
+        # Disable CBC's integer preprocessing; branch-and-bound still runs when
+        # the relaxation is fractional.
         # Pass as a single string: PuLP prefixes each options entry with "-",
         # so this becomes the CBC flag "-preprocess off".
         solver = pulp.PULP_CBC_CMD(msg=verbose, options=["preprocess off"])
@@ -1186,22 +1183,28 @@ class ShardingOptimizer:
             self.prob.solve(solver)
         solve_s = time.perf_counter() - t0
 
+        status = pulp.LpStatus.get(self.prob.status, self.prob.status)
+        if status != "Optimal":
+            if status == "Infeasible":
+                logger.warning(self.get_violated_constraints_log())
+                raise RuntimeError(
+                    "The sharding optimizer could not find a feasible solution. "
+                    "This typically means the user-specified constraints are "
+                    "contradictory or the device mesh is too small for the requested "
+                    "sharding. Check the WARNING log above for the list of violated "
+                    "constraints, and consider relaxing input/output constraints or "
+                    "using a larger mesh."
+                )
+            raise RuntimeError(
+                f"The sharding optimizer solve ended with status={status}"
+            )
+
         self.selected_keys = [
             key for key, dv in self.decision_vars.items() if dv.var.value() == 1
         ]
         for root_key in list(self.selected_keys):
             self.selected_keys.extend(self._linked_option_keys(root_key))
 
-        if self.prob.status == -1:
-            logger.warning(self.get_violated_constraints_log())
-            raise RuntimeError(
-                "The sharding optimizer could not find a feasible solution. "
-                "This typically means the user-specified constraints are "
-                "contradictory or the device mesh is too small for the requested "
-                "sharding. Check the WARNING log above for the list of violated "
-                "constraints, and consider relaxing input/output constraints or "
-                "using a larger mesh."
-            )
         return solve_s
 
     def solve_lp_relaxation(self, verbose=False, frac_tol=1e-6, extract=False):
@@ -1241,6 +1244,7 @@ class ShardingOptimizer:
                 solver.tmpDir = tmpdir
                 self.prob.solve(solver)
             solve_time = time.perf_counter() - t0
+            status = pulp.LpStatus.get(self.prob.status, self.prob.status)
             objective = pulp.value(self.prob.objective)
             n_fractional = 0
             n_vars = 0
@@ -1252,6 +1256,10 @@ class ShardingOptimizer:
                 if min(val, 1.0 - val) > frac_tol:
                     n_fractional += 1
             solution = None
+            if extract and status != "Optimal":
+                raise RuntimeError(
+                    f"LP relaxation did not solve to optimality: status={status}"
+                )
             if extract and n_fractional == 0:
                 for v in variables:
                     value = v.value()
@@ -1279,14 +1287,18 @@ class ShardingOptimizer:
             for v, cat in zip(variables, original_cats):
                 v.cat = cat
             self.prob.objective = old_objective
-        return {
+        result = {
             "objective": objective,
             "solve_time": solve_time,
             "n_fractional": n_fractional,
             "n_vars": n_vars,
-            "status": pulp.LpStatus[self.prob.status],
+            "status": status,
             "solution": solution,
         }
+        self.profile["lp_relaxation"] = {
+            key: value for key, value in result.items() if key != "solution"
+        }
+        return result
 
     def _extract_and_validate_solution(self):
         """Validate the ILP solution and return the optimal strategy per node."""
@@ -1308,6 +1320,19 @@ class ShardingOptimizer:
                     f"solutions: {[str(dv.strategy) for dv in selected_by_node[node]]}"
                 )
             seen.add(node_arg)
+
+        expected = {
+            (self.node_map[node], argi)
+            for node, strategies in self.strats.items()
+            if node.op != "output"
+            for argi in range(len(strategies.strategies[0].input_specs))
+        }
+        missing = expected - seen
+        if missing:
+            node_idx, argi = min(missing)
+            raise RuntimeError(
+                f"Missing solution for {self.nodes[node_idx]}, key={(node_idx, argi)}"
+            )
 
         # Validate: all args of a node agree on the same strategy
         for node, dvs in selected_by_node.items():
@@ -1332,12 +1357,17 @@ class ShardingOptimizer:
     def get_solution(self, verbose=False):
         t0 = time.perf_counter()
         self._set_objective()
-        self._solve(verbose)
+        solve_s = self._solve(verbose)
         obj_value = self._safe_float(pulp.value(self.prob.objective))
         solution = self._to_orig_solution(self._extract_and_validate_solution())
-        logger.info(
-            "ILP solve took %.3fs (objective=%.4f)", time.perf_counter() - t0, obj_value
-        )
+        total_s = time.perf_counter() - t0
+        self.profile["ilp"] = {
+            "objective": obj_value,
+            "status": pulp.LpStatus.get(self.prob.status, self.prob.status),
+            "solve_s": solve_s,
+            "total_s": total_s,
+        }
+        logger.info("ILP solve took %.3fs (objective=%.4f)", total_s, obj_value)
         return solution
 
     def resolve(self, verbose=False):
@@ -1347,12 +1377,19 @@ class ShardingOptimizer:
         be called multiple times after modifying constraints.
         """
         t0 = time.perf_counter()
-        self._solve(verbose)
+        solve_s = self._solve(verbose)
         obj_value = self._safe_float(pulp.value(self.prob.objective))
         solution = self._to_orig_solution(self._extract_and_validate_solution())
+        total_s = time.perf_counter() - t0
+        self.profile["ilp"] = {
+            "objective": obj_value,
+            "status": pulp.LpStatus.get(self.prob.status, self.prob.status),
+            "solve_s": solve_s,
+            "total_s": total_s,
+        }
         logger.info(
             "ILP re-solve took %.3fs (objective=%.4f)",
-            time.perf_counter() - t0,
+            total_s,
             obj_value,
         )
         return solution

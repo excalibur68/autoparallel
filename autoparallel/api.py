@@ -6,6 +6,7 @@
 import copy
 import json
 import logging
+import math
 import operator
 import time
 from contextlib import ExitStack, contextmanager
@@ -413,7 +414,7 @@ class AutoParallel:
 
     def optimize_placement(
         self,
-        verbose=True,
+        verbose=False,
         solver=None,
         approximate_options=None,
         optimality_check=False,
@@ -437,16 +438,20 @@ class AutoParallel:
         self._assert_entered()
         if solver is None:
             solver = self.solver
+        if solver not in self.SOLVER_CHOICES:
+            raise ValueError(
+                f"Unknown solver={solver!r}; expected one of {self.SOLVER_CHOICES}"
+            )
 
         opt = self.sharding_optimizer
-        if solver in ("approx", "approximate"):
+        if solver == "approx":
             from .approximate_sharding import ApproximateShardingSolver
 
             approx = ApproximateShardingSolver(opt, **(approximate_options or {}))
             self.sharding_placement = approx.get_solution(verbose=verbose)
         elif solver == "ilp":
             self.sharding_placement = opt.get_solution(verbose=False)
-        elif solver in ("lp", "lp_relax", "lp_relaxation"):
+        elif solver == "lp":
             opt._set_objective()
             res = opt.solve_lp_relaxation(verbose=verbose, extract=True)
             if res["solution"] is None:
@@ -456,11 +461,6 @@ class AutoParallel:
                     "variables). Use solver='ilp' for an exact integral solve."
                 )
             self.sharding_placement = res["solution"]
-        else:
-            raise ValueError(
-                f"Unknown solver={solver!r}; expected one of {self.SOLVER_CHOICES}"
-            )
-
         if optimality_check:
             self._log_optimality_check(solver, verbose=verbose)
 
@@ -512,20 +512,26 @@ class AutoParallel:
             logger.warning(
                 "optimality_check skipped: solver=%r build has no PuLP problem; "
                 "construct with solver='ilp' or 'lp' to enable it.",
-                self.solver,
+                solver,
             )
             return
         achieved = opt._safe_float(pulp.value(opt.prob.objective))
         lb_res = opt.get_lower_bound(verbose=verbose)
         lb = lb_res.objective
-        if not lb or lb <= 0 or achieved is None:
+        if (
+            lb_res.status != "Optimal"
+            or not math.isfinite(lb)
+            or lb <= 0
+            or not math.isfinite(achieved)
+        ):
             logger.warning(
-                "optimality_check inconclusive: lower_bound=%s achieved=%s",
+                "optimality_check inconclusive: status=%s lower_bound=%s achieved=%s",
+                lb_res.status,
                 lb,
                 achieved,
             )
             return
-        gap = (achieved - lb) / lb
+        gap = max((achieved - lb) / lb, 0.0)
         logger.info(
             "optimality check (solver=%s): objective=%.4f LP lower bound=%.4f "
             "=> within %.2f%% of optimum (certified)",

@@ -17,6 +17,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
 from autoparallel.approximate_sharding import ApproximateShardingSolver
+from autoparallel.optimize_sharding import LPRelaxationResult
 
 
 def _fake_2d_mesh():
@@ -63,8 +64,7 @@ def _add_constraints(autop, mesh):
 @pytest.mark.filterwarnings("ignore:Constructing LpVariable")
 @pytest.mark.filterwarnings("ignore:Overwriting previously set objective")
 def test_approx_objective_close_to_ilp():
-    """The approximate solver should be much faster than the ILP while staying
-    within a small objective gap on a tiny LLaMA3 block + 2D mesh."""
+    """The approximate objective stays close to the exact ILP objective."""
     mesh = _fake_2d_mesh()
     with _tiny_llama3_autop(mesh) as autop:
         _add_constraints(autop, mesh)
@@ -72,6 +72,9 @@ def test_approx_objective_close_to_ilp():
 
         autop.optimize_placement(verbose=False, solver="approx")
         approx_objective = pulp.value(opt.prob.objective)
+        assert opt.profile["approximate"]["status"] == "Heuristic"
+        assert opt.profile["approximate"]["build_s"] >= 0
+        assert opt.profile["approximate"]["solve_s"] >= 0
         # The approx assignment must be ILP-feasible (flow consistency etc.);
         # an infeasible assignment can score artificially low and silently pass
         # the objective bound below.
@@ -80,6 +83,8 @@ def test_approx_objective_close_to_ilp():
 
         autop.optimize_placement(verbose=False, solver="ilp")
         ilp_objective = pulp.value(opt.prob.objective)
+        assert opt.profile["ilp"]["status"] == "Optimal"
+        assert opt.profile["ilp"]["solve_s"] >= 0
 
         assert math.isfinite(approx_objective)
         assert ilp_objective > 0
@@ -138,6 +143,8 @@ def test_lp_solver_matches_ilp():
 
         autop.optimize_placement(verbose=False, solver="lp")
         lp_objective = pulp.value(opt.prob.objective)
+        assert opt.profile["lp_relaxation"]["status"] == "Optimal"
+        assert opt.profile["lp_relaxation"]["solve_time"] >= 0
         assert all(var.value() in (0.0, 1.0) for var in opt.pulp_variables.values())
         violated = [n for n, c in opt.prob.constraints.items() if not c.valid()]
         assert not violated, f"lp violated {len(violated)} constraints"
@@ -166,6 +173,31 @@ def test_optimality_check_logs_certified_gap(caplog):
 
 @apply_cuda_patches
 @pytest.mark.filterwarnings("ignore:Constructing LpVariable")
+def test_optimality_check_requires_optimal_lower_bound(caplog, monkeypatch):
+    mesh = _fake_2d_mesh()
+    with _tiny_llama3_autop(mesh) as autop:
+        _add_constraints(autop, mesh)
+        opt = autop.sharding_optimizer
+        monkeypatch.setattr(
+            opt,
+            "get_lower_bound",
+            lambda verbose=False: LPRelaxationResult(
+                objective=1.0,
+                status="Not Solved",
+                solve_s=0.0,
+                total_s=0.0,
+            ),
+        )
+        with caplog.at_level(logging.INFO, logger="autoparallel.api"):
+            autop.optimize_placement(
+                verbose=False, solver="approx", optimality_check=True
+            )
+        assert any("inconclusive" in record.message for record in caplog.records)
+        assert not any("certified" in record.message for record in caplog.records)
+
+
+@apply_cuda_patches
+@pytest.mark.filterwarnings("ignore:Constructing LpVariable")
 def test_approx_objective_is_faithful():
     """The solver's internal energy must equal the exact ILP objective evaluated
     on its assignment (pulp.value), so comparisons against the ILP are valid."""
@@ -186,6 +218,8 @@ def test_approx_objective_is_faithful():
         # And every ILP constraint must hold (flow consistency, paired, memory).
         violated = [n for n, c in opt.prob.constraints.items() if not c.valid()]
         assert not violated, f"approx violated {len(violated)} constraints"
+        assert opt.prob.status == pulp.LpStatusNotSolved
+        assert opt.prob.sol_status == pulp.LpSolutionIntegerFeasible
 
 
 @apply_cuda_patches
@@ -215,3 +249,14 @@ def test_approx_respects_input_output_constraints():
         }
         assert x_sharding in placements
         assert out_sharding in placements
+
+
+@apply_cuda_patches
+def test_solver_names_are_canonical():
+    mesh = _fake_2d_mesh()
+    with pytest.raises(ValueError, match="Unknown solver"):
+        _tiny_llama3_autop(mesh, solver="approximate")
+
+    with _tiny_llama3_autop(mesh) as autop:
+        with pytest.raises(ValueError, match="Unknown solver"):
+            autop.optimize_placement(solver="lp_relaxation")

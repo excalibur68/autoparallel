@@ -939,3 +939,9 @@ def test_invalid_strategies_are_pruned(device_mesh_2d):
         param_nodes = get_param_nodes(autop.gm.graph)
         for node in param_nodes:
             assert node in solution
+        expected_nodes = {
+            opt._concrete_to_orig.get(node, node)
+            for node in opt.strats
+            if node.op != "output"
+        }
+        assert set(solution) == expected_nodes

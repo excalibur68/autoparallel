@@ -177,8 +177,8 @@ class ApproximateShardingSolver:
         t_bp0 = time.perf_counter()
         mem = self._memory
         if mem is not None and not mem.get("tight"):
-            # A non-tight budget can bind the runtime-optimal placement; solve it
-            # exactly via Lagrangian relaxation (folds λ·ratio into the unaries).
+            # A non-tight budget can bind the runtime-optimal placement; account
+            # for it via Lagrangian relaxation (folds λ·ratio into the unaries).
             # A tight budget is already handled by build-time param pinning, and
             # the no-memory case has nothing to relax, so both take the plain path.
             res = self.solve_lagrangian(
@@ -239,11 +239,21 @@ class ApproximateShardingSolver:
             t_solve,
             total_s,
         )
-        opt.profile["approximate"] = {"objective": objective}
+        opt.profile["approximate"] = {
+            "objective": result.objective,
+            "status": result.status,
+            "build_s": result.build_s,
+            "solve_s": result.solve_s,
+            "total_s": result.total_s,
+            "num_groups": result.num_groups,
+            "num_nodes": result.num_nodes,
+        }
         if infeasible:
+            violations = getattr(self, "_violated_constraints", [])
+            detail = f" Violated constraints: {violations[:20]}" if violations else ""
             raise RuntimeError(
                 "ApproximateShardingSolver could not find a feasible assignment. "
-                "User constraints may be contradictory or the mesh too small."
+                f"User constraints may be contradictory or the mesh too small.{detail}"
             )
         solution = opt._to_orig_solution(opt._extract_and_validate_solution())
         return result, solution
@@ -353,22 +363,24 @@ class ApproximateShardingSolver:
         for name, c in opt.prob.constraints.items():
             if name.startswith("output_input_consistent"):
                 # +side = producer (grouped by out), -side = consumer (grouped by
-                # inp at a fixed arg). One +var and one -var pin down the edge.
-                pos_key = neg_key = None
+                # inp at a fixed arg). A one-sided row forbids every variable on
+                # its surviving side.
+                pos_keys = []
+                neg_keys = []
                 for var, coeff in c.items():
                     k = var_to_key.get(var)
                     if k is None:
                         continue
                     if coeff > 0:
-                        pos_key = pos_key or k
+                        pos_keys.append(k)
                     else:
-                        neg_key = neg_key or k
-                    if pos_key is not None and neg_key is not None:
-                        break
-                if pos_key is not None and neg_key is not None:
-                    authoritative.setdefault((neg_key[0], neg_key[1]), set()).add(
-                        pos_key[0]
-                    )
+                        neg_keys.append(k)
+                if pos_keys and neg_keys:
+                    authoritative.setdefault(
+                        (neg_keys[0][0], neg_keys[0][1]), set()
+                    ).add(pos_keys[0][0])
+                else:
+                    self.forbidden.update(pos_keys or neg_keys)
                 continue
             if name.startswith(self._SKIP_PREFIXES):
                 continue
@@ -1266,7 +1278,14 @@ class ApproximateShardingSolver:
         opt.selected_keys = list(selected)
         for rk in selected:
             opt.selected_keys.extend(opt._linked_option_keys(rk))
-        opt.prob.status = pulp.LpStatusOptimal
-        opt.prob.sol_status = pulp.LpSolutionOptimal
         opt._set_objective()
+        self._violated_constraints = [
+            name
+            for name, constraint in opt.prob.constraints.items()
+            if not constraint.valid(1e-6)
+        ]
+        feasible = feasible and not self._violated_constraints
+        if feasible:
+            opt.prob.status = pulp.LpStatusNotSolved
+            opt.prob.sol_status = pulp.LpSolutionIntegerFeasible
         return INF if not feasible else self.total_objective()
