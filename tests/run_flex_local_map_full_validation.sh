@@ -112,7 +112,7 @@ properties = [
     for index in range(torch.cuda.device_count())
 ]
 environment = {
-    "timestamp_utc": datetime.datetime.now(datetime.UTC).isoformat(),
+    "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "branch": git("branch", "--show-current"),
     "head": git("rev-parse", "HEAD"),
     "base_ref": sys.argv[2],
@@ -227,5 +227,3 @@ fi
 
 run_stage numerics \
   "$PYTHON_BIN" tests/compare_flex_local_map_validation.py "$RESULTS_DIR"
-
-printf 'Validation report: %s/summary.md\n' "$RESULTS_DIR"
