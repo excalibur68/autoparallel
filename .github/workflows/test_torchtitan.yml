@@ -21,7 +21,7 @@ jobs:
         include:
           - name: 12xlargegpu
             runs-on: linux.g5.12xlarge.nvidia.gpu
-            torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu126'
+            torch-spec: 'torch==2.14.0.dev20260729+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126'
             gpu-arch-type: "cuda"
             gpu-arch-version: "12.6"
     with:
@@ -38,19 +38,27 @@ jobs:
         pip install --quiet -r requirements-test.txt
         # For some reason the spec above isnt working
         pip uninstall -y torch
-        pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
+        pip install --no-input --quiet 'torch==2.14.0.dev20260729+cu126' --index-url https://download.pytorch.org/whl/nightly/cu126
         pip install --quiet .
 
         # Clone TorchTitan
         git clone https://github.com/pytorch/torchtitan.git
         cd torchtitan
+        git checkout c91448d20480c7b294314e68976823050002ebec
         pip install --quiet -r requirements.txt
 
         # Run TorchTitan training with AutoParallel
         NGPU=4 ./run_train.sh \
-          --module autoparallel.llama3 \
-          --config autoparallel_llama3_debugmodel \
-          --parallelism.tensor_parallel_degree 4
+          --module graph_trainer.llama3 \
+          --config graph_trainer_llama3_debugmodel_sdpa_cross_entropy_loss \
+          --compile.mode aot_fx_trace \
+          --compile.enable_autoparallel \
+          --parallelism.data_parallel_shard_degree 2 \
+          --parallelism.tensor_parallel_degree 2 \
+          --training.global_batch_size 4 \
+          --training.local_batch_size 2 \
+          --training.seq_len 32 \
+          --training.steps 2
 
         # TODO: Re-enable deepseek_v3 test once torchtitan experiment is fixed
         # (deepseek_v3 experiment is also disabled in torchtitan's own CI)
