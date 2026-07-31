@@ -316,6 +316,8 @@ def _filter_by_strategy_seed(out_strat):
         if placements is None or within_strategy_seed_ball(placements):
             kept.append(strategy)
 
+    # Some operator rules cannot produce any strategy inside the requested ball.
+    # Keep their original domain so the best-effort restriction stays feasible.
     return out_strat if not kept else OpStrategy(kept)
 
 

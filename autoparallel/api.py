@@ -238,6 +238,10 @@ class AutoParallel:
         fast_build: Skip DTensor enumeration costs that AutoParallel recomputes.
         lazy_costs: Compute approximate-solver costs on demand. Only supported
             with ``solver="approx"``; ``False`` retains eager costs for A/B checks.
+        strategy_radius: Restrict final strategy enumeration to a best-effort
+            Hamming ball around independently solved per-dimension placements.
+        seed_input_placements: Input placement used by the per-dimension seed
+            solves. Required with strategy_radius, with one entry per mesh dim.
     """
 
     # Selectable solvers. "ilp": exact PuLP/CBC. "approx": heuristic TRW-S
@@ -274,6 +278,19 @@ class AutoParallel:
             )
         if lazy_costs is True and solver != "approx":
             raise ValueError("lazy_costs=True requires solver='approx'")
+        if (strategy_radius is None) != (seed_input_placements is None):
+            raise ValueError(
+                "strategy_radius and seed_input_placements must be provided together"
+            )
+        if strategy_radius is not None and strategy_radius < 0:
+            raise ValueError("strategy_radius must be non-negative")
+        if (
+            seed_input_placements is not None
+            and len(seed_input_placements) != mesh.ndim
+        ):
+            raise ValueError(
+                "seed_input_placements must contain one placement per mesh dim"
+            )
         self.solver = solver
         self.fake_mode = (
             FakeTensorMode()
@@ -354,11 +371,10 @@ class AutoParallel:
                 > self.mp_policy.param_dtype.itemsize
             )
             strategy_seed = None
-            if self.strategy_radius is not None:
-                assert self.seed_input_placements is not None, (
-                    "strategy_radius requires seed_input_placements "
-                    "(one input placement per mesh dim)"
-                )
+            if (
+                self.strategy_radius is not None
+                and self.seed_input_placements is not None
+            ):
                 from .mesh_search import build_split_dim_seed
 
                 strategy_seed = build_split_dim_seed(
@@ -369,6 +385,7 @@ class AutoParallel:
                     force_grad_reduce_in_higher_precision=force_grad_reduce_in_higher_precision,
                     repeated_subgraphs=self.repeated_subgraphs,
                     fast_build=self.fast_build,
+                    device_type=self.mesh.device_type,
                 )
             sharding_optimizer = ShardingOptimizer(
                 self.gm,

@@ -48,6 +48,58 @@ def _input_fn():
     return torch.randn(8, 16, device="cuda", requires_grad=True)
 
 
+@pytest.mark.parametrize(
+    ("strategy_radius", "seed_input_placements", "message"),
+    (
+        (2, None, "must be provided together"),
+        (None, (Shard(0), Replicate(), Replicate()), "must be provided together"),
+        (-1, (Shard(0), Replicate(), Replicate()), "must be non-negative"),
+        (2, (Shard(0), Replicate()), "one placement per mesh dim"),
+    ),
+)
+@apply_cuda_patches
+def test_split_dim_public_options_validate(
+    device_mesh_3d, strategy_radius, seed_input_placements, message
+):
+    with torch.device("meta"):
+        model = TinyMLP()
+
+    with pytest.raises(ValueError, match=message):
+        AutoParallel(
+            model,
+            _input_fn,
+            device_mesh_3d,
+            strategy_radius=strategy_radius,
+            seed_input_placements=seed_input_placements,
+        )
+
+
+@apply_cuda_patches
+def test_auto_parallel_split_dim_search(device_mesh_3d):
+    with torch.device("meta"):
+        model = TinyMLP()
+
+    placement = (Shard(0), Replicate(), Replicate())
+    with AutoParallel(
+        model,
+        _input_fn,
+        device_mesh_3d,
+        repeated_subgraphs=False,
+        solver="approx",
+        strategy_radius=2,
+        seed_input_placements=placement,
+    ) as autop:
+        autop.add_parameter_memory_constraint(low=None, high=None)
+        autop.add_input_constraints([placement])
+        autop.add_output_constraints([placement])
+        solution = autop.optimize_placement()
+
+    assert solution
+    profile = autop.sharding_optimizer.profile["approximate"]
+    assert profile["status"] == "Heuristic"
+    assert math.isfinite(profile["objective"])
+
+
 def test_split_dim_projects_local_map_placements(device_mesh_3d):
     dim_names = device_mesh_3d.mesh_dim_names
     assert dim_names is not None
