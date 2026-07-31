@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
-from typing import Any, Callable, Iterator, cast
+from typing import Any, Callable, Iterator
 
 import torch
 from torch._subclasses.fake_tensor import unset_fake_temporarily
@@ -71,14 +71,13 @@ def _split_dim_seed_dim_cost_model(
 
 def _split_dim_seed_cache_key(
     size: int,
-    input_placement: Placement,
+    boundary_placements: tuple[Any, ...],
     cost_model: Any,
     mesh_shape: tuple[int, ...],
     dim_idx: int,
     *,
     fabric_aware: bool,
 ) -> tuple[Any, ...]:
-    placement = _placement_code(input_placement)
     if isinstance(cost_model, NCCLTopoConfig):
         dim_cost_model = _split_dim_seed_dim_cost_model(
             cost_model, mesh_shape, dim_idx, fabric_aware=fabric_aware
@@ -87,7 +86,7 @@ def _split_dim_seed_cache_key(
         return (
             "nccl",
             int(size),
-            placement,
+            boundary_placements,
             tuple(mesh_shape),
             dim_idx,
             cost_model.arch.name,
@@ -105,7 +104,13 @@ def _split_dim_seed_cache_key(
             dim_cost_model.has_collnet,
             dim_cost_model.net_latency,
         )
-    return (str(cost_model), int(size), placement, tuple(mesh_shape), dim_idx)
+    return (
+        str(cost_model),
+        int(size),
+        boundary_placements,
+        tuple(mesh_shape),
+        dim_idx,
+    )
 
 
 def _first_output_placements(output_specs) -> tuple[Placement, ...] | None:
@@ -141,6 +146,36 @@ def _project_placements_to_dim(
     return tuple(projected)
 
 
+def _project_constraints_to_dim(constraints, dim_idx: int, ndim: int):
+    if constraints is None:
+        return None
+    projected: list[tuple[Placement, ...] | None] = []
+    for placements in constraints:
+        if placements is None:
+            projected.append(None)
+            continue
+        if len(placements) != ndim:
+            raise ValueError(
+                f"placement constraint has {len(placements)} entries, expected {ndim}"
+            )
+        projected.append((placements[dim_idx],))
+    return projected
+
+
+def _constraint_cache_key(input_constraints, output_constraints) -> tuple[Any, ...]:
+    def placements_key(constraints):
+        if constraints is None:
+            return None
+        return tuple(
+            None
+            if placements is None
+            else tuple(_placement_code(placement) for placement in placements)
+            for placements in constraints
+        )
+
+    return placements_key(input_constraints), placements_key(output_constraints)
+
+
 @contextmanager
 def _project_local_map_to_dim(
     gm: torch.fx.GraphModule, mesh_1d, dim_idx: int, ndim: int
@@ -167,11 +202,12 @@ def _project_local_map_to_dim(
             node.meta["local_map_kwargs"] = local_map_kwargs
 
 
-def build_split_dim_seed(
+def _build_split_dim_seed(
     gm: torch.fx.GraphModule,
     mesh_shape: tuple[int, ...],
-    input_placements: tuple[Placement, ...],
     *,
+    input_constraints=None,
+    output_constraints=None,
     cost_model: Any = "nccl",
     force_grad_reduce_in_higher_precision: bool = False,
     repeated_subgraphs: bool = True,
@@ -186,7 +222,8 @@ def build_split_dim_seed(
     Args:
         gm: Joint graph to optimize.
         mesh_shape: Target mesh shape.
-        input_placements: Required input placement for each target mesh dim.
+        input_constraints: Optional user input placement constraints.
+        output_constraints: Optional user output placement constraints.
         cost_model: Cost model identifier or NCCL topology config.
         force_grad_reduce_in_higher_precision: Whether gradient reductions use
             higher precision costs.
@@ -203,10 +240,6 @@ def build_split_dim_seed(
     """
 
     ndim = len(mesh_shape)
-    if len(input_placements) != ndim:
-        raise ValueError(
-            f"input_placements has {len(input_placements)} entries, expected {ndim}"
-        )
     if memory_high_fn is None:
         memory_high_fn = lambda size: 1.0 / size  # noqa: E731
 
@@ -223,10 +256,11 @@ def build_split_dim_seed(
 
     per_dim: list[dict[str, Placement]] = []
     for dim_idx, size in enumerate(mesh_shape):
-        input_placement = input_placements[dim_idx]
+        dim_inputs = _project_constraints_to_dim(input_constraints, dim_idx, ndim)
+        dim_outputs = _project_constraints_to_dim(output_constraints, dim_idx, ndim)
         key = _split_dim_seed_cache_key(
             int(size),
-            input_placement,
+            _constraint_cache_key(dim_inputs, dim_outputs),
             seed_cost_model,
             mesh_shape,
             dim_idx,
@@ -257,8 +291,10 @@ def build_split_dim_seed(
                         repeated_subgraphs=repeated_subgraphs,
                         fast_build=fast_build,
                     )
-                    opt.add_sharded_input_constraint([(input_placement,)])
-                    opt.add_sharded_output_constraint([(input_placement,)])
+                    if dim_inputs is not None:
+                        opt.add_sharded_input_constraint(dim_inputs)
+                    if dim_outputs is not None:
+                        opt.add_sharded_output_constraint(dim_outputs)
                     opt.add_parameter_memory_constraint(0.0, memory_high_fn(int(size)))
                     solution = opt.get_solution()
             finally:
@@ -279,17 +315,5 @@ def build_split_dim_seed(
         seed[node.name] = tuple(
             per_dim[i].get(node.name, Replicate()) for i in range(ndim)
         )
-
-    from torch._functorch._aot_autograd.fx_utils import (
-        get_plain_input_and_grad_nodes,
-        get_plain_output_and_tangent_nodes,
-    )
-
-    input_tuple = tuple(input_placements)
-    for getter in (get_plain_input_and_grad_nodes, get_plain_output_and_tangent_nodes):
-        for _desc, (node, companion) in cast(Any, getter(gm.graph)).items():
-            seed[node.name] = input_tuple
-            if companion is not None:
-                seed[companion.name] = input_tuple
 
     return seed

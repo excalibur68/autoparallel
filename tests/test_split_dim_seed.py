@@ -20,9 +20,9 @@ from autoparallel._testing.models.dsv3 import (
 from autoparallel.api import AutoParallel
 from autoparallel.cost_models.nccl_cost_model import h100_topo_config
 from autoparallel.mesh_search import (
+    _build_split_dim_seed,
     _project_local_map_to_dim,
     _split_dim_seed_cache_key,
-    build_split_dim_seed,
 )
 from autoparallel.optimize_sharding import ShardingOptimizer
 
@@ -49,18 +49,16 @@ def _input_fn():
 
 
 @pytest.mark.parametrize(
-    ("strategy_radius", "seed_input_placements", "message"),
+    ("strategy_radius", "message"),
     (
-        (2, None, "must be provided together"),
-        (None, (Shard(0), Replicate(), Replicate()), "must be provided together"),
-        (-1, (Shard(0), Replicate(), Replicate()), "must be non-negative"),
-        (2, (Shard(0), Replicate()), "one placement per mesh dim"),
+        (-1, "must be non-negative"),
+        (3, "smaller than the mesh dimensionality"),
+        (1.5, "must be an integer"),
+        (True, "must be an integer"),
     ),
 )
 @apply_cuda_patches
-def test_split_dim_public_options_validate(
-    device_mesh_3d, strategy_radius, seed_input_placements, message
-):
+def test_split_dim_public_options_validate(device_mesh_3d, strategy_radius, message):
     with torch.device("meta"):
         model = TinyMLP()
 
@@ -69,9 +67,53 @@ def test_split_dim_public_options_validate(
             model,
             _input_fn,
             device_mesh_3d,
+            solver="approx",
             strategy_radius=strategy_radius,
-            seed_input_placements=seed_input_placements,
         )
+
+
+@apply_cuda_patches
+def test_split_dim_large_radius_warns():
+    with unset_fake_temporarily():
+        mesh = init_device_mesh(
+            "cuda", (2, 2, 2, 2), mesh_dim_names=("d0", "d1", "d2", "d3")
+        )
+    with torch.device("meta"):
+        model = TinyMLP()
+
+    with pytest.warns(UserWarning, match="greater than 2"):
+        AutoParallel(model, _input_fn, mesh, solver="approx", strategy_radius=3)
+
+
+@pytest.mark.parametrize("strategy_radius", (None, 0))
+@apply_cuda_patches
+def test_split_dim_can_be_disabled(device_mesh_3d, strategy_radius):
+    with torch.device("meta"):
+        model = TinyMLP()
+
+    with AutoParallel(
+        model,
+        _input_fn,
+        device_mesh_3d,
+        repeated_subgraphs=False,
+        solver="approx",
+        strategy_radius=strategy_radius,
+    ) as autop:
+        placement = (Shard(0), Replicate(), Replicate())
+        autop.add_input_constraints([placement])
+        autop.add_output_constraints([placement])
+        solution = autop.optimize_placement(verbose=False)
+
+    assert solution
+
+
+@apply_cuda_patches
+def test_split_dim_radius_ignored_for_non_approx_and_2d(device_mesh_2d, device_mesh_3d):
+    with torch.device("meta"):
+        model = TinyMLP()
+
+    AutoParallel(model, _input_fn, device_mesh_3d, solver="ilp", strategy_radius=-1)
+    AutoParallel(model, _input_fn, device_mesh_2d, solver="approx", strategy_radius=2)
 
 
 @apply_cuda_patches
@@ -86,8 +128,6 @@ def test_auto_parallel_split_dim_search(device_mesh_3d):
         device_mesh_3d,
         repeated_subgraphs=False,
         solver="approx",
-        strategy_radius=2,
-        seed_input_placements=placement,
     ) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
         autop.add_input_constraints([placement])
@@ -134,10 +174,11 @@ def test_split_dim_projects_local_map_placements(device_mesh_3d):
         assert node.meta["local_map_kwargs"] is local_map_kwargs
 
     shape = tuple(device_mesh_3d.shape)
+    constraints = ((("R",),), (("R",),))
     assert _split_dim_seed_cache_key(
-        shape[0], Replicate(), "roofline", shape, 0, fabric_aware=False
+        shape[0], constraints, "roofline", shape, 0, fabric_aware=False
     ) != _split_dim_seed_cache_key(
-        shape[1], Replicate(), "roofline", shape, 1, fabric_aware=False
+        shape[1], constraints, "roofline", shape, 1, fabric_aware=False
     )
 
 
@@ -164,10 +205,11 @@ def test_split_dim_seed_hamming_space_solves_with_ilp_and_lp():
         cost_model=config,
         repeated_subgraphs=False,
     ) as autop:
-        seed = build_split_dim_seed(
+        seed = _build_split_dim_seed(
             autop.gm,
             tuple(mesh.shape),
-            input_placement,
+            input_constraints=[input_placement],
+            output_constraints=[input_placement],
             cost_model=config,
             repeated_subgraphs=False,
             one_d_cache=one_d_cache,
