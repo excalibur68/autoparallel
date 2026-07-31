@@ -1,0 +1,220 @@
+{
+  "autoparallel": {
+    "dp": 2,
+    "gpus": 4,
+    "losses": {
+      "1": 12.35139274597168,
+      "2": 11.850981712341309,
+      "3": 13.678144454956055,
+      "4": 11.0912446975708,
+      "5": 10.893821716308594,
+      "6": 10.321163177490234,
+      "7": 9.989482879638672,
+      "8": 9.725540161132812,
+      "9": 9.690787315368652,
+      "10": 9.308286666870117,
+      "11": 9.153558731079102,
+      "12": 9.035903930664062,
+      "13": 9.028413772583008,
+      "14": 8.798540115356445,
+      "15": 8.882816314697266,
+      "16": 8.784974098205566,
+      "17": 8.689208984375,
+      "18": 8.562541961669922,
+      "19": 8.435615539550781,
+      "20": 8.432969093322754
+    },
+    "tp": 2
+  },
+  "autoparallel_codebase": {
+    "changed_files_from_merge_base": [
+      "M\t.github/workflows/test_cuda.yml",
+      "M\tautoparallel/_testing/models/dsv3.py",
+      "A\tautoparallel/_testing/models/qwen3.py",
+      "M\tautoparallel/export_json.py",
+      "M\tautoparallel/shardings/placement_options.py",
+      "M\tautoparallel/tools/overlap_simulator/run.py",
+      "A\texamples/example_qwen3.py",
+      "A\ttests/qwen3_dense_distributed.py",
+      "A\ttests/qwen3_moe_distributed.py",
+      "A\ttests/qwen3_torchtitan_dense_distributed.py",
+      "A\ttests/test_dsv3_torchtitan_config.py",
+      "A\ttests/test_qwen3.py"
+    ],
+    "commit": "1d68a0fbbc0565a4529bd315c2a1d5e985d7d361",
+    "merge_base": "a54c2529b1cb10b6b27a585b4a6fc2f84bc1d232",
+    "origin_main": "a54c2529b1cb10b6b27a585b4a6fc2f84bc1d232"
+  },
+  "baseline": {
+    "dp": 1,
+    "gpus": 1,
+    "losses": {
+      "1": 12.370559692382812,
+      "2": 10.811031341552734,
+      "3": 12.150374412536621,
+      "4": 10.8790283203125,
+      "5": 10.349281311035156,
+      "6": 9.95474910736084,
+      "7": 9.697257041931152,
+      "8": 9.576688766479492,
+      "9": 9.178173065185547,
+      "10": 8.957210540771484,
+      "11": 8.946296691894531,
+      "12": 8.927513122558594,
+      "13": 8.754939079284668,
+      "14": 8.664342880249023,
+      "15": 8.630367279052734,
+      "16": 8.474781036376953,
+      "17": 8.515673637390137,
+      "18": 8.267213821411133,
+      "19": 8.485296249389648,
+      "20": 8.131475448608398
+    },
+    "tp": 1
+  },
+  "command": [
+    "/home/wangkj/.conda/envs/autop-ci-py312/bin/python",
+    "/tmp/pr482-final-repro/torchtitan/scripts/loss_compare.py",
+    ".",
+    ".",
+    "--baseline-module=qwen3_torchtitan_dense_distributed",
+    "--baseline-config=qwen3_0_6b_ce_baseline",
+    "--test-module=qwen3_torchtitan_dense_distributed",
+    "--test-config=qwen3_0_6b_autoparallel",
+    "--baseline-options=--parallelism.data_parallel_shard_degree=1 --parallelism.tensor_parallel_degree=1 --training.global_batch_size=4 --training.local_batch_size=4 --training.seq_len=4096",
+    "--test-options=--parallelism.data_parallel_shard_degree=2 --parallelism.tensor_parallel_degree=2 --training.global_batch_size=4 --training.local_batch_size=2 --training.seq_len=4096",
+    "--steps=20",
+    "--baseline-ngpus=1",
+    "--test-ngpus=4",
+    "--job-dump-folder=/dev/shm/pr482-qwen-loss-final-work-1/job",
+    "--output-folder=/tmp/pr482-qwen-loss-final-1/loss_compare"
+  ],
+  "comparison": "Behavioral curve comparison only: DP-dependent C4 sharding and packing differ, so no stepwise numerical-equivalence claim is made.",
+  "configuration": {
+    "activation_checkpoint": {
+      "debug": false,
+      "determinism_check": "default",
+      "early_stop": false,
+      "memory_budget": 0.5,
+      "mode": "selective",
+      "per_op_sac_force_recompute_mm_shapes_by_fqns": [
+        "moe.router.gate"
+      ],
+      "preserve_rng_state": true,
+      "visualize_memory_budget_pareto": false
+    },
+    "autoparallel": {
+      "data_parallel_shard_degree": 2,
+      "gpus": 4,
+      "input_placements": [
+        "Shard(0)",
+        "Replicate()"
+      ],
+      "local_batch_size": 2,
+      "mesh_dim_names": [
+        "fsdp",
+        "tp"
+      ],
+      "output_placements": [
+        "Shard(0)",
+        "Replicate()"
+      ],
+      "tensor_parallel_degree": 2
+    },
+    "baseline": {
+      "data_parallel_shard_degree": 1,
+      "gpus": 1,
+      "local_batch_size": 4,
+      "tensor_parallel_degree": 1
+    },
+    "checkpoint": {
+      "export_dtype": "bfloat16",
+      "load_only": true
+    },
+    "compile": {
+      "backend": "inductor",
+      "components": [
+        "model",
+        "loss"
+      ],
+      "enable": false
+    },
+    "data": {
+      "config": "en",
+      "repo": "allenai/c4",
+      "revision": "1588ec454efa1a09f29cd18ddd04fe05fc8653a2",
+      "sample_field": "text",
+      "split": "train",
+      "streaming": true
+    },
+    "determinism": {
+      "enabled": true,
+      "seed": 42,
+      "seed_checkpoint": true
+    },
+    "loss": "torchtitan.components.loss.CrossEntropyLoss",
+    "lr_scheduler": {
+      "decay_ratio": null,
+      "decay_type": "linear",
+      "min_lr_factor": 0.0,
+      "total_steps": null,
+      "warmup_steps": 2
+    },
+    "model": {
+      "attention_backend": "sdpa",
+      "config": "qwen3_0_6b",
+      "flavor": "0.6B",
+      "module": "torchtitan.models.qwen3"
+    },
+    "optimizer": {
+      "beta1": 0.9,
+      "beta2": 0.95,
+      "eps": 1e-08,
+      "implementation": "fused",
+      "lr": 0.0003,
+      "name": "AdamW",
+      "param_groups": [],
+      "weight_decay": 0.1
+    },
+    "tokenizer": {
+      "repo": "Qwen/Qwen3-0.6B",
+      "revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+    },
+    "tokens_per_step": 16384,
+    "training_common": {
+      "dtype": "float32",
+      "enable_cpu_offload": false,
+      "gc_debug": false,
+      "gc_freq": 50,
+      "global_batch_size": 4,
+      "max_norm": 1.0,
+      "mixed_precision_param": "bfloat16",
+      "mixed_precision_reduce": "float32",
+      "seq_len": 4096,
+      "steps": 20
+    }
+  },
+  "environment": {
+    "cuda": "13.0",
+    "cudnn": 92301,
+    "gpus": [
+      "NVIDIA H100",
+      "NVIDIA H100",
+      "NVIDIA H100",
+      "NVIDIA H100"
+    ],
+    "python": "3.12.13",
+    "torch": "2.14.0.dev20260629+cu130",
+    "torch_git": "e3fbbff12273e7cf6b3d0dbdde26c61e421e4320"
+  },
+  "raw_logs": {
+    "autoparallel": "/tmp/pr482-qwen-loss-final-1/loss_compare/test_training.log",
+    "baseline": "/tmp/pr482-qwen-loss-final-1/loss_compare/baseline_training.log",
+    "seed": "/tmp/pr482-qwen-loss-final-1/loss_compare/seed_training.log"
+  },
+  "result_source": "TensorBoard loss_metrics/global_avg_loss",
+  "runs": 1,
+  "steps": 20,
+  "torchtitan_commit": "52a292d2977690d407bd81781de932f7f7dc56c5",
+  "variance": null
+}

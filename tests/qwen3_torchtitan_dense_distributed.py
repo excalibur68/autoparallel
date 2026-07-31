@@ -439,7 +439,12 @@ def _write_plot(
         fill=axis_color,
         font=_font(22),
     )
-    draw.text((20, top - 45), "Global average CE loss", fill=axis_color, font=_font(22))
+    draw.text(
+        (left, top - 32),
+        "Global average CE loss",
+        fill=axis_color,
+        font=_font(22),
+    )
     note = "DP differs between runs; curves compare training behavior, not stepwise numeric parity."
     draw.text(
         (left, height - 38),
