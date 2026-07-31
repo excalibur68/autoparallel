@@ -14,6 +14,8 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.collectives import local_map
+from autoparallel.optimize_sharding import _skip_enumeration_redistribute_cost
+from autoparallel.shardings.placement_options import reset_placement_options_cache
 
 
 class FFN(nn.Module):
@@ -183,8 +185,30 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
 
 
 @apply_cuda_patches
-def test_fast_build_preserves_optimizer_solution(device_mesh_1d):
+def test_fast_build_falls_back_without_torch_cost(monkeypatch):
+    import torch.distributed.tensor._ops.utils as dt_utils
+
+    monkeypatch.delattr(dt_utils, "redistribute_cost")
+    with _skip_enumeration_redistribute_cost(True):
+        pass
+
+
+@apply_cuda_patches
+def test_fast_build_preserves_optimizer_solution(device_mesh_1d, monkeypatch):
+    import torch.distributed.tensor._ops.utils as dt_utils
+
+    original_redistribute_cost = dt_utils.redistribute_cost
+    redistribute_cost_calls = 0
+
+    def counted_redistribute_cost(*args, **kwargs):
+        nonlocal redistribute_cost_calls
+        redistribute_cost_calls += 1
+        return original_redistribute_cost(*args, **kwargs)
+
+    monkeypatch.setattr(dt_utils, "redistribute_cost", counted_redistribute_cost)
+
     def solve(fast_build):
+        reset_placement_options_cache()
         model_fn, input_fn = _make_model_and_input_fn(
             device_mesh_1d, "transformer_block"
         )
@@ -197,13 +221,28 @@ def test_fast_build_preserves_optimizer_solution(device_mesh_1d):
             autop.add_output_constraints([(Shard(0),)])
             autop.add_parameter_memory_constraint(low=None, high=None)
             solution = autop.optimize_placement()
-        return {
-            node.name: tuple(str(p) for p in strategy.output_specs.placements)
-            for node, strategy in solution.items()
-            if not isinstance(strategy.output_specs, (tuple, list))
-        }
+            objective = autop.sharding_optimizer.prob.objective.value()
+        return (
+            {
+                node.name: tuple(str(p) for p in strategy.output_specs.placements)
+                for node, strategy in solution.items()
+                if not isinstance(strategy.output_specs, (tuple, list))
+            },
+            objective,
+        )
 
-    assert solve(True) == solve(False)
+    try:
+        baseline_solution, baseline_objective = solve(False)
+        baseline_calls = redistribute_cost_calls
+        fast_solution, fast_objective = solve(True)
+
+        assert baseline_calls > 0
+        assert redistribute_cost_calls == baseline_calls
+        assert dt_utils.redistribute_cost is counted_redistribute_cost
+        assert fast_solution == baseline_solution
+        assert fast_objective == pytest.approx(baseline_objective)
+    finally:
+        reset_placement_options_cache()
 
 
 _expected_param_placements_ffn = [(Shard(0), Shard(0)), (Shard(0), Shard(1))]

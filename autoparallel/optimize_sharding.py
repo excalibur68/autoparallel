@@ -115,14 +115,19 @@ def _skip_enumeration_redistribute_cost(enabled):
         yield
         return
 
-    import torch.distributed.tensor._ops.utils as dt_utils
+    try:
+        import torch.distributed.tensor._ops.utils as dt_utils
 
-    orig = dt_utils.redistribute_cost
+        original = dt_utils.redistribute_cost
+    except (ImportError, AttributeError):
+        yield
+        return
+
     dt_utils.redistribute_cost = lambda *args, **kwargs: 0.0
     try:
         yield
     finally:
-        dt_utils.redistribute_cost = orig
+        dt_utils.redistribute_cost = original
 
 
 def concretize_symint(val):
