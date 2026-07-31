@@ -540,9 +540,18 @@ def _write_report(
     torchtitan_root: Path,
     baseline_losses: dict[int, float],
     autoparallel_losses: dict[int, float],
-    output_dir: Path,
 ) -> None:
     repo_root = Path(__file__).resolve().parents[1]
+    portable_command = [
+        "python",
+        "$TORCHTITAN_ROOT/scripts/loss_compare.py",
+    ]
+    for argument in command[2:]:
+        if argument.startswith("--job-dump-folder="):
+            argument = "--job-dump-folder=$WORK_DIR/job"
+        elif argument.startswith("--output-folder="):
+            argument = "--output-folder=$OUTPUT_DIR/loss_compare"
+        portable_command.append(argument)
     report = {
         "autoparallel_codebase": _git_metadata(repo_root),
         "torchtitan_commit": _git_revision(torchtitan_root),
@@ -563,11 +572,11 @@ def _write_report(
         "variance": None,
         "result_source": "TensorBoard loss_metrics/global_avg_loss",
         "environment": _environment(),
-        "command": command,
+        "command": portable_command,
         "raw_logs": {
-            "seed": str(output_dir / "loss_compare" / "seed_training.log"),
-            "baseline": str(output_dir / "loss_compare" / "baseline_training.log"),
-            "autoparallel": str(output_dir / "loss_compare" / "test_training.log"),
+            "seed": "loss_compare/seed_training.log",
+            "baseline": "loss_compare/baseline_training.log",
+            "autoparallel": "loss_compare/test_training.log",
         },
     }
     path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
@@ -623,7 +632,6 @@ def main():
         torchtitan_root=torchtitan_root,
         baseline_losses=baseline_losses,
         autoparallel_losses=autoparallel_losses,
-        output_dir=output_dir,
     )
     print(f"Artifacts written to {output_dir}", flush=True)
 

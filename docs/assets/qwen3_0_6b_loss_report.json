@@ -73,8 +73,8 @@
     "tp": 1
   },
   "command": [
-    "/home/wangkj/.conda/envs/autop-ci-py312/bin/python",
-    "/tmp/pr482-final-repro/torchtitan/scripts/loss_compare.py",
+    "python",
+    "$TORCHTITAN_ROOT/scripts/loss_compare.py",
     ".",
     ".",
     "--baseline-module=qwen3_torchtitan_dense_distributed",
@@ -86,8 +86,8 @@
     "--steps=20",
     "--baseline-ngpus=1",
     "--test-ngpus=4",
-    "--job-dump-folder=/dev/shm/pr482-qwen-loss-final-work-1/job",
-    "--output-folder=/tmp/pr482-qwen-loss-final-1/loss_compare"
+    "--job-dump-folder=$WORK_DIR/job",
+    "--output-folder=$OUTPUT_DIR/loss_compare"
   ],
   "comparison": "Behavioral curve comparison only: DP-dependent C4 sharding and packing differ, so no stepwise numerical-equivalence claim is made.",
   "configuration": {
@@ -208,9 +208,9 @@
     "torch_git": "e3fbbff12273e7cf6b3d0dbdde26c61e421e4320"
   },
   "raw_logs": {
-    "autoparallel": "/tmp/pr482-qwen-loss-final-1/loss_compare/test_training.log",
-    "baseline": "/tmp/pr482-qwen-loss-final-1/loss_compare/baseline_training.log",
-    "seed": "/tmp/pr482-qwen-loss-final-1/loss_compare/seed_training.log"
+    "autoparallel": "loss_compare/test_training.log",
+    "baseline": "loss_compare/baseline_training.log",
+    "seed": "loss_compare/seed_training.log"
   },
   "result_source": "TensorBoard loss_metrics/global_avg_loss",
   "runs": 1,
