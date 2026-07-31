@@ -64,6 +64,16 @@ def _tiny_moe_args(**overrides) -> Qwen3ModelArgs:
     return args
 
 
+def test_qwen3_model_args_reject_invalid_head_ratio():
+    with pytest.raises(ValueError, match="must be divisible"):
+        Qwen3ModelArgs(n_heads=3, n_kv_heads=2)
+
+
+def test_qwen3_model_args_reject_too_many_selected_experts():
+    with pytest.raises(ValueError, match="top_k .* must be <= num_experts"):
+        Qwen3ModelArgs(moe_enabled=True, num_experts=2, top_k=3)
+
+
 def test_qwen3_forward_shape():
     args = _tiny_args()
     model = Transformer(args)

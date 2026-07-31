@@ -56,6 +56,7 @@ jobs:
         run_timed python examples/example_autoparallel.py
         run_timed env AUTOPARALLEL_VERBOSE=1 python examples/example_llama3.py
         run_timed python examples/example_local_map.py
+        run_timed python examples/example_qwen3.py
         echo "========== Timings =========="
         cat /tmp/timings.txt
 
@@ -80,3 +81,13 @@ jobs:
         pip install --quiet .
         python -m pytest tests/test_dcp_roundtrip.py -v
         torchrun --standalone --nproc-per-node 4 examples/example_ds3_local_map.py
+        torchrun --standalone --nproc-per-node 4 \
+          tests/qwen3_moe_distributed.py \
+          --flavor moe-tiny \
+          --seq-len 8 \
+          --dp-degree 2 \
+          --ep-degree 2 \
+          --global-batch-size 4 \
+          --microbatch-size 1 \
+          --train-steps 2 \
+          --optimizer sgd

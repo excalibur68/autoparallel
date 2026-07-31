@@ -143,7 +143,7 @@ def make_model_args(flavor: str, seq_len: int | None) -> Qwen3ModelArgs:
             score_before_experts=False,
             moe_axis_name="ep",
         )
-    overrides = {"moe_axis_name": "ep"}
+    overrides: dict[str, object] = {"moe_axis_name": "ep"}
     if seq_len is not None:
         overrides["max_seq_len"] = seq_len
     if flavor == "moe-debug":
@@ -158,9 +158,9 @@ def make_model_args(flavor: str, seq_len: int | None) -> Qwen3ModelArgs:
 def init_distributed(args):
     if "WORLD_SIZE" not in os.environ or "LOCAL_RANK" not in os.environ:
         raise RuntimeError(
-            "Run this example with torchrun, e.g. "
+            "Run this validation with torchrun, e.g. "
             "torchrun --standalone --nproc-per-node 4 "
-            "examples/example_sanity_check_qwen3_moe.py"
+            "tests/qwen3_moe_distributed.py"
         )
 
     world_size = int(os.environ["WORLD_SIZE"])

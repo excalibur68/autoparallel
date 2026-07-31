@@ -93,9 +93,9 @@ def parse_args():
 def init_distributed(args):
     if "WORLD_SIZE" not in os.environ or "LOCAL_RANK" not in os.environ:
         raise RuntimeError(
-            "Run this example with torchrun, e.g. "
+            "Run this validation with torchrun, e.g. "
             "torchrun --standalone --nproc-per-node 4 "
-            "examples/example_sanity_check_qwen3.py"
+            "tests/qwen3_dense_distributed.py"
         )
 
     world_size = int(os.environ["WORLD_SIZE"])

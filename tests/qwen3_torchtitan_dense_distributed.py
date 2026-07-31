@@ -24,8 +24,11 @@ from autoparallel.compile import autoparallel_backend
 def _add_sibling_torchtitan_to_path() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     torchtitan_root = repo_root.parent / "torchtitan"
-    if torchtitan_root.exists():
-        sys.path.insert(0, str(torchtitan_root))
+    if not torchtitan_root.exists():
+        raise RuntimeError(
+            f"TorchTitan sibling checkout not found at {torchtitan_root}."
+        )
+    sys.path.insert(0, str(torchtitan_root))
 
 
 _add_sibling_torchtitan_to_path()
@@ -122,9 +125,9 @@ def make_model_config(flavor: str, seq_len: int) -> Qwen3Model.Config:
 def init_distributed(args):
     if "WORLD_SIZE" not in os.environ or "LOCAL_RANK" not in os.environ:
         raise RuntimeError(
-            "Run this example with torchrun, e.g. "
+            "Run this validation with torchrun, e.g. "
             "torchrun --standalone --nproc-per-node 4 "
-            "examples/example_torchtitan_qwen3_dense.py"
+            "tests/qwen3_torchtitan_dense_distributed.py"
         )
 
     world_size = int(os.environ["WORLD_SIZE"])
@@ -249,6 +252,7 @@ def main():
     torch.manual_seed(args.seed)
     model_config = make_model_config(args.flavor, args.seq_len)
     vocab_size = model_config.vocab_size
+    trace_global_batch_size = args.microbatch_size * args.dp_degree
 
     with torch.device("meta"):
         model = model_config.build()
@@ -257,7 +261,7 @@ def main():
         return torch.randint(
             0,
             vocab_size,
-            (args.global_batch_size, args.seq_len),
+            (trace_global_batch_size, args.seq_len),
             device=device,
         )
 
@@ -273,6 +277,7 @@ def main():
         f"local_batch={local_batch_size}, "
         f"microbatch={args.microbatch_size}, "
         f"grad_accum={gradient_accumulation_steps}, "
+        f"trace_global_batch={trace_global_batch_size}, "
         f"seq_len={args.seq_len}"
     )
 
