@@ -23,6 +23,7 @@ import numpy as np
 import pulp
 
 from .cost_models.compute_estimation import _get_sharded_shape_stride
+from .optimize_sharding import _INVALID_COST
 
 logger = logging.getLogger(__name__)
 
@@ -346,10 +347,10 @@ class ApproximateShardingSolver:
     def _parse_constraints(self):
         opt = self.opt
         # inf-cost keys are forced to 0 by add_inf_cost_constraint, which also
-        # stamps dv.cost = 10000.0. Detect them directly instead of parsing the
-        # (very numerous) inf_cases constraints.
+        # stamps dv.cost = _INVALID_COST. Detect them directly instead of
+        # parsing the (very numerous) inf_cases constraints.
         for key, dv in opt.decision_vars.items():
-            if dv.cost == 10000.0:
+            if dv.cost == _INVALID_COST:
                 self.forbidden.add(key)
 
         var_to_key = {var: key for key, var in opt.pulp_variables.items()}
@@ -619,11 +620,9 @@ class ApproximateShardingSolver:
     # ------------------------------------------------------------------ #
     def _build_memory_info(self):
         opt = self.opt
-        factors = None
-        for fname, kwargs in getattr(opt, "_constraint_log", []):
-            if fname == "add_parameter_memory_constraint":
-                factors = kwargs
-        if factors is None:
+        self._memory = None
+        memory_constraint = getattr(opt, "_memory_constraint", None)
+        if memory_constraint is None:
             return
         try:
             from torch._functorch._aot_autograd.fx_utils import get_param_nodes
@@ -632,7 +631,7 @@ class ApproximateShardingSolver:
         except Exception:
             return
 
-        low_f, high_f = factors["memory_factor_low"], factors["memory_factor_high"]
+        low_f, high_f = memory_constraint
         budget_low = budget_high = 0.0
         param_idxs, ratios = [], {}
         for node in param_nodes:

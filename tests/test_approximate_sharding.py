@@ -216,6 +216,7 @@ def test_approx_objective_is_faithful():
         # No forbidden decision variable should be selected.
         assert all(key not in solver.forbidden for key in opt.selected_keys)
         # And every ILP constraint must hold (flow consistency, paired, memory).
+        opt._apply_memory_constraint()
         violated = [n for n, c in opt.prob.constraints.items() if not c.valid()]
         assert not violated, f"approx violated {len(violated)} constraints"
         assert opt.prob.status == pulp.LpStatusNotSolved

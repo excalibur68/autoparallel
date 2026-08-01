@@ -108,6 +108,9 @@ from .shardings.propagation_rules import _create_all_options
 
 logger = logging.getLogger(__name__)
 
+# Supported cost models are nonnegative; invalid variables are fixed to zero.
+_INVALID_COST = -1.0
+
 # Strategy enumeration fills each OpSpec's redistribute_cost via torch's
 # generate_redistribute_costs (an expensive per-strategy redistribute-plan
 # computation, the dominant cost of build on large/3D meshes). But
@@ -1007,7 +1010,7 @@ class ShardingOptimizer:
         """
         for key, dv in self.decision_vars.items():
             if not math.isfinite(dv.cost):
-                dv.cost = 10000.0
+                dv.cost = _INVALID_COST
                 self.prob += (dv.var == 0, self._get_next_name("inf_cases"))
 
     def add_default_constraints(self):
@@ -1403,6 +1406,11 @@ class ShardingOptimizer:
             self._node_constraint_names.pop(name, None)
             if name in memory_names:
                 self._memory_constraint = None
+                self._constraint_log = [
+                    entry
+                    for entry in self._constraint_log
+                    if entry[0] != "add_parameter_memory_constraint"
+                ]
 
     def diff_solutions(self, solution_a, solution_b):
         """Compare two solutions and report placement changes and cost diffs.
