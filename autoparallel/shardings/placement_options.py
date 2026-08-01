@@ -289,7 +289,8 @@ def _seed_cache_key():
     if seed is None:
         return None
     node_name = get_current_seed_node()
-    placements = seed.get(node_name) if node_name is not None else None
+    node_seed = seed.get(node_name) if node_name is not None else None
+    placements = None if node_seed is None else node_seed.output_placements
     placement_key = None if placements is None else tuple(str(p) for p in placements)
     # Key on the seed PLACEMENT (not node_name): the seed-filtered result depends only
     # on (op, input specs, seed placement, radius), so repeated ops across layers with

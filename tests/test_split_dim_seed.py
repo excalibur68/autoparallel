@@ -11,20 +11,39 @@ import torch
 from conftest import apply_cuda_patches
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.tensor._dtensor_spec import TensorMeta
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from autoparallel._testing.models.dsv3 import (
+    DeepSeekV3Model,
     MoEMeshRoles,
     build_moe_local_map_placements,
+    build_moe_mesh,
+    make_dsv3_config,
 )
 from autoparallel.api import AutoParallel
+from autoparallel.approximate_sharding import ApproximateShardingSolver
+from autoparallel.cost_models.collective_runtime_estimation import (
+    estimate_strategy_comms_cost,
+)
 from autoparallel.cost_models.nccl_cost_model import h100_topo_config
 from autoparallel.mesh_search import (
     _build_split_dim_seed,
+    _combine_op_spec_seeds,
     _project_local_map_to_dim,
     _split_dim_seed_cache_key,
 )
-from autoparallel.optimize_sharding import ShardingOptimizer
+from autoparallel.optimize_sharding import (
+    ShardingOptimizer,
+    _seed_spec_is_well_formed,
+    _strategy_matches_seed,
+)
+from autoparallel.shardings.propagation_rules import (
+    DTensorSpecSeed,
+    OpSpecSeed,
+    StrategySeed,
+)
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:Constructing LpVariable.*:DeprecationWarning"),
@@ -46,6 +65,279 @@ class TinyMLP(torch.nn.Module):
 
 def _input_fn():
     return torch.randn(8, 16, device="cuda", requires_grad=True)
+
+
+def _tensor_meta(shape, dtype=torch.float32):
+    tensor = torch.empty(shape, dtype=dtype, device="meta")
+    return TensorMeta(tensor.shape, tensor.stride(), tensor.dtype)
+
+
+def _spec_seed(placements, tensor_meta):
+    return DTensorSpecSeed(tuple(placements), tensor_meta)
+
+
+def test_combine_split_dim_op_specs_preserves_rmsnorm_seeded_edge():
+    input_meta = _tensor_meta((8, 2048, 256))
+    output_meta = _tensor_meta((256,))
+    sum_per_dim = [
+        OpSpecSeed(
+            output_specs=_spec_seed((Partial("sum"),), output_meta),
+            input_specs=(_spec_seed((Shard(0),), input_meta),),
+        )
+        for _ in range(3)
+    ]
+    dtype_per_dim = [
+        OpSpecSeed(
+            output_specs=_spec_seed((Shard(0),), output_meta),
+            input_specs=(_spec_seed((Shard(0),), output_meta),),
+        )
+        for _ in range(3)
+    ]
+
+    sum_seed = _combine_op_spec_seeds(sum_per_dim)
+    dtype_seed = _combine_op_spec_seeds(dtype_per_dim)
+
+    assert sum_seed is not None
+    assert isinstance(sum_seed.output_specs, DTensorSpecSeed)
+    assert sum_seed.output_specs.placements == (Partial("sum"),) * 3
+    assert sum_seed.input_specs is not None
+    assert sum_seed.input_specs[0].placements == (Shard(0),) * 3
+    assert dtype_seed is not None
+    assert isinstance(dtype_seed.output_specs, DTensorSpecSeed)
+    assert dtype_seed.output_specs.placements == (Shard(0),) * 3
+    assert dtype_seed.input_specs is not None
+    assert dtype_seed.input_specs[0].placements == (Shard(0),) * 3
+
+
+def test_combine_split_dim_op_specs_preserves_optional_outputs():
+    tensor_meta = _tensor_meta((8, 2048, 256))
+    per_dim = [
+        OpSpecSeed(
+            output_specs=(_spec_seed((Shard(0),), tensor_meta), None),
+            input_specs=(_spec_seed((Replicate(),), tensor_meta),),
+        )
+        for _ in range(3)
+    ]
+
+    combined = _combine_op_spec_seeds(per_dim)
+
+    assert combined is not None
+    assert isinstance(combined.output_specs, tuple)
+    assert combined.output_specs[0].placements == (Shard(0),) * 3
+    assert combined.output_specs[1] is None
+
+
+def test_combine_split_dim_op_specs_rejects_structural_mismatch():
+    tensor_meta = _tensor_meta((256,))
+    single = OpSpecSeed(
+        output_specs=_spec_seed((Shard(0),), tensor_meta),
+        input_specs=(_spec_seed((Shard(0),), tensor_meta),),
+    )
+    multiple = OpSpecSeed(
+        output_specs=(_spec_seed((Shard(0),), tensor_meta), None),
+        input_specs=(_spec_seed((Shard(0),), tensor_meta),),
+    )
+
+    assert _combine_op_spec_seeds([single, single, multiple]) is None
+
+
+def test_seed_spec_validation_rejects_invalid_target_mesh_specs():
+    tensor_meta = _tensor_meta((256,))
+
+    assert not _seed_spec_is_well_formed(
+        _spec_seed((Shard(0), Shard(0)), tensor_meta), 3
+    )
+    assert not _seed_spec_is_well_formed(_spec_seed((Shard(1),) * 3, tensor_meta), 3)
+    assert not _seed_spec_is_well_formed(DTensorSpecSeed((Replicate(),) * 3, None), 3)
+
+
+@apply_cuda_patches
+def test_split_dim_preserves_complete_rmsnorm_seeded_edge():
+    with unset_fake_temporarily():
+        mesh = init_device_mesh(
+            "cuda", (2, 2, 2), mesh_dim_names=("outer", "middle", "inner")
+        )
+
+    input_value = torch.empty((8, 2048, 256), device="meta")
+    output_value = torch.empty((256,), device="meta")
+    graph = torch.fx.Graph()
+    input_node = graph.placeholder("input")
+    sum_node = graph.call_function(torch.ops.aten.sum.dim_IntList, (input_node, [0, 1]))
+    dtype_node = graph.call_function(
+        torch.ops.autoparallel.dtype_cast.default, (sum_node, torch.float32)
+    )
+    alias_node = graph.call_function(torch.ops.aten.alias.default, (dtype_node,))
+    output_node = graph.output(alias_node)
+    input_node.meta["val"] = input_value
+    sum_node.meta["val"] = output_value
+    dtype_node.meta["val"] = output_value
+    alias_node.meta["val"] = output_value
+    output_node.meta["val"] = output_value
+    gm = torch.fx.GraphModule({}, graph)
+
+    sss = (Shard(0),) * 3
+    ppp = (Partial("sum"),) * 3
+    input_meta = _tensor_meta(input_value.shape)
+    output_meta = _tensor_meta(output_value.shape)
+    input_spec = _spec_seed(sss, input_meta)
+    output_spec = _spec_seed(sss, output_meta)
+    seed = {
+        input_node.name: StrategySeed(
+            sss, OpSpecSeed(output_specs=input_spec, input_specs=(input_spec,))
+        ),
+        sum_node.name: StrategySeed(
+            ppp,
+            OpSpecSeed(
+                output_specs=_spec_seed(ppp, output_meta),
+                input_specs=(input_spec,),
+            ),
+        ),
+        dtype_node.name: StrategySeed(
+            sss,
+            OpSpecSeed(output_specs=output_spec, input_specs=(output_spec,)),
+        ),
+        alias_node.name: StrategySeed(
+            sss,
+            OpSpecSeed(output_specs=output_spec, input_specs=(output_spec,)),
+        ),
+    }
+
+    optimizer = ShardingOptimizer(
+        gm,
+        mesh,
+        repeated_subgraphs=False,
+        build_pulp=False,
+        build_costs=True,
+        strategy_seed=seed,
+        strategy_radius=2,
+    )
+    nodes = {node.name: node for node in optimizer.graph.nodes}
+    sum_strategies = optimizer.strats[nodes[sum_node.name]].strategies
+    dtype_strategies = optimizer.strats[nodes[dtype_node.name]].strategies
+
+    assert all(strategy.output_spec.placements != sss for strategy in sum_strategies)
+    sum_seed_index = next(
+        index
+        for index, strategy in enumerate(sum_strategies)
+        if strategy.output_spec.placements == ppp
+        and strategy.input_specs[0].placements == sss
+    )
+    dtype_seed = next(
+        strategy
+        for strategy in dtype_strategies
+        if strategy.output_spec.placements == sss
+        and strategy.input_specs[0].placements == sss
+    )
+    assert len(dtype_seed.redistribute_cost[0]) == len(sum_strategies)
+    assert math.isfinite(dtype_seed.redistribute_cost[0][sum_seed_index])
+
+
+@apply_cuda_patches
+def test_real_dsv3_split_dim_search_preserves_all_complete_witnesses():
+    mesh, roles = build_moe_mesh(
+        dp_replicate=1,
+        dp_shard=4,
+        cp=1,
+        tp=2,
+        ep=4,
+    )
+    config = make_dsv3_config(num_experts=8, max_seq_len=2048)
+    with torch.device("meta"):
+        model = DeepSeekV3Model(
+            config,
+            mesh=mesh,
+            roles=roles,
+            compute_dtype=torch.float32,
+        )
+
+    def input_fn():
+        return torch.empty(8, 2048, dtype=torch.int64, device="cuda")
+
+    placements = (Shard(0),) * mesh.ndim
+    with AutoParallel(
+        model,
+        input_fn,
+        mesh,
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+        ),
+        dynamic=True,
+        solver="approx",
+        lazy_costs=True,
+        strategy_radius=2,
+    ) as autop:
+        autop.add_parameter_memory_constraint(low=None, high=None)
+        autop.add_input_constraints([placements])
+        autop.add_output_constraints([placements])
+        autop._build_split_dim_optimizer()
+        optimizer = autop.sharding_optimizer
+        assert optimizer is not None
+        approximate = ApproximateShardingSolver(optimizer)
+        solution = approximate.get_solution(verbose=False)
+
+    assert solution
+    assert math.isfinite(optimizer.profile["approximate"]["objective"])
+
+    missing = []
+    for node, strategies in optimizer.strats.items():
+        if node.op == "output":
+            continue
+        node_seed = optimizer.strategy_seed.get(node.name)
+        if node_seed is None or node_seed.witness is None:
+            continue
+        if not any(
+            _strategy_matches_seed(strategy, node_seed.witness)
+            for strategy in strategies.strategies
+        ):
+            missing.append(node.name)
+    assert not missing
+
+    sss = (Shard(0),) * mesh.ndim
+    ppp = (Partial("sum"),) * mesh.ndim
+    seeded_chain = None
+    for dtype_node in optimizer.graph.nodes:
+        if dtype_node.target != torch.ops.autoparallel.dtype_cast.default:
+            continue
+        input_nodes = optimizer._all_input_nodes(dtype_node)
+        if len(input_nodes) != 1:
+            continue
+        sum_node = input_nodes[0]
+        if sum_node.target != torch.ops.aten.sum.dim_IntList:
+            continue
+        sum_seed = optimizer.strategy_seed.get(sum_node.name)
+        dtype_seed = optimizer.strategy_seed.get(dtype_node.name)
+        if (
+            sum_seed is not None
+            and dtype_seed is not None
+            and sum_seed.output_placements == ppp
+            and dtype_seed.output_placements == sss
+        ):
+            seeded_chain = sum_node, dtype_node, sum_seed, dtype_seed
+            break
+    assert seeded_chain is not None
+
+    sum_node, dtype_node, sum_seed, dtype_seed = seeded_chain
+    assert sum_seed.witness is not None
+    assert dtype_seed.witness is not None
+    sum_strategy = next(
+        strategy
+        for strategy in optimizer.strats[sum_node].strategies
+        if _strategy_matches_seed(strategy, sum_seed.witness)
+    )
+    dtype_strategy = next(
+        strategy
+        for strategy in optimizer.strats[dtype_node].strategies
+        if _strategy_matches_seed(strategy, dtype_seed.witness)
+    )
+    assert sum_strategy.output_spec.placements == ppp
+    assert dtype_strategy.input_specs[0].placements == sss
+    assert dtype_strategy.output_spec.placements == sss
+    assert math.isfinite(
+        estimate_strategy_comms_cost(
+            sum_strategy.output_spec, dtype_strategy.input_specs[0]
+        )
+    )
 
 
 @pytest.mark.parametrize(

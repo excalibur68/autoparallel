@@ -28,6 +28,7 @@ from .cost_models.nccl_cost_model import (
 )
 from .optimize_sharding import ShardingOptimizer
 from .shardings.placement_options import reset_placement_options_cache
+from .shardings.propagation_rules import DTensorSpecSeed, OpSpecSeed, StrategySeed
 
 
 def reset_mesh_search_caches() -> None:
@@ -113,14 +114,110 @@ def _split_dim_seed_cache_key(
     )
 
 
-def _first_output_placements(output_specs) -> tuple[Placement, ...] | None:
+def _spec_to_seed(spec: DTensorSpec | None) -> DTensorSpecSeed | None:
+    if spec is None:
+        return None
+    return DTensorSpecSeed(tuple(spec.placements), spec.tensor_meta)
+
+
+def _op_spec_to_seed(strategy) -> OpSpecSeed:
+    output_specs = strategy.output_specs
+    seeded_outputs: DTensorSpecSeed | tuple[DTensorSpecSeed | None, ...] | None
     if isinstance(output_specs, DTensorSpec):
-        return output_specs.placements
-    if isinstance(output_specs, (tuple, list)):
-        for output_spec in output_specs:
-            if isinstance(output_spec, DTensorSpec):
-                return output_spec.placements
+        seeded_outputs = _spec_to_seed(output_specs)
+    elif isinstance(output_specs, (tuple, list)):
+        seeded_outputs = tuple(_spec_to_seed(spec) for spec in output_specs)
+    else:
+        seeded_outputs = None
+
+    input_specs = strategy.input_specs
+    return OpSpecSeed(
+        output_specs=seeded_outputs,
+        input_specs=(
+            None
+            if input_specs is None
+            else tuple(_spec_to_seed(spec) for spec in input_specs)
+        ),
+    )
+
+
+def _first_seeded_output(seed: OpSpecSeed) -> DTensorSpecSeed | None:
+    output_specs = seed.output_specs
+    if isinstance(output_specs, DTensorSpecSeed):
+        return output_specs
+    if isinstance(output_specs, tuple):
+        return next(
+            (spec for spec in output_specs if isinstance(spec, DTensorSpecSeed)), None
+        )
     return None
+
+
+def _combine_spec_seeds(
+    per_dim: list[DTensorSpecSeed | None],
+) -> tuple[bool, DTensorSpecSeed | None]:
+    if all(spec is None for spec in per_dim):
+        return True, None
+    if any(spec is None for spec in per_dim):
+        return False, None
+
+    specs = [spec for spec in per_dim if spec is not None]
+    if any(len(spec.placements) != 1 for spec in specs):
+        return False, None
+    tensor_meta = specs[0].tensor_meta
+    if any(spec.tensor_meta != tensor_meta for spec in specs[1:]):
+        return False, None
+    return True, DTensorSpecSeed(
+        tuple(spec.placements[0] for spec in specs), tensor_meta
+    )
+
+
+def _combine_output_seeds(
+    per_dim: list[DTensorSpecSeed | tuple[DTensorSpecSeed | None, ...] | None],
+):
+    if all(output is None for output in per_dim):
+        return True, None
+    if all(isinstance(output, DTensorSpecSeed) for output in per_dim):
+        return _combine_spec_seeds(per_dim)  # type: ignore[arg-type]
+    if not all(isinstance(output, tuple) for output in per_dim):
+        return False, None
+
+    outputs = [output for output in per_dim if isinstance(output, tuple)]
+    if not outputs or any(len(output) != len(outputs[0]) for output in outputs[1:]):
+        return False, None
+    combined = []
+    for index in range(len(outputs[0])):
+        valid, spec = _combine_spec_seeds([output[index] for output in outputs])
+        if not valid:
+            return False, None
+        combined.append(spec)
+    return True, tuple(combined)
+
+
+def _combine_op_spec_seeds(per_dim: list[OpSpecSeed]) -> OpSpecSeed | None:
+    valid, output_specs = _combine_output_seeds(
+        [strategy.output_specs for strategy in per_dim]
+    )
+    if not valid:
+        return None
+
+    input_specs = [strategy.input_specs for strategy in per_dim]
+    if all(specs is None for specs in input_specs):
+        combined_inputs = None
+    elif any(specs is None for specs in input_specs):
+        return None
+    else:
+        inputs = [specs for specs in input_specs if specs is not None]
+        if any(len(specs) != len(inputs[0]) for specs in inputs[1:]):
+            return None
+        combined = []
+        for index in range(len(inputs[0])):
+            slot_valid, spec = _combine_spec_seeds([specs[index] for specs in inputs])
+            if not slot_valid:
+                return None
+            combined.append(spec)
+        combined_inputs = tuple(combined)
+
+    return OpSpecSeed(output_specs=output_specs, input_specs=combined_inputs)
 
 
 def _project_placements_to_dim(
@@ -213,11 +310,11 @@ def _build_split_dim_seed(
     repeated_subgraphs: bool = True,
     fast_build: bool = True,
     memory_high_fn: Callable[[int], float] | None = None,
-    one_d_cache: dict[tuple[Any, ...], dict[str, Placement]] | None = None,
+    one_d_cache: dict[tuple[Any, ...], dict[str, OpSpecSeed]] | None = None,
     device_type: str = "cuda",
     fabric_aware: bool = True,
-) -> dict[str, tuple[Placement, ...]]:
-    """Return a per-node placement seed for a target mesh shape.
+) -> dict[str, StrategySeed]:
+    """Return per-node placement centers and complete strategy witnesses.
 
     Args:
         gm: Joint graph to optimize.
@@ -236,7 +333,7 @@ def _build_split_dim_seed(
         fabric_aware: Whether one-dimensional solves use per-dim fabric topology.
 
     Returns:
-        A mapping from FX node name to placement tuple.
+        A mapping from FX node name to its placement center and optional witness.
     """
 
     ndim = len(mesh_shape)
@@ -254,7 +351,7 @@ def _build_split_dim_seed(
             )
         seed_cost_model = detect_nccl_topo_config(full_mesh)
 
-    per_dim: list[dict[str, Placement]] = []
+    per_dim: list[dict[str, OpSpecSeed]] = []
     for dim_idx, size in enumerate(mesh_shape):
         dim_inputs = _project_constraints_to_dim(input_constraints, dim_idx, ndim)
         dim_outputs = _project_constraints_to_dim(output_constraints, dim_idx, ndim)
@@ -300,20 +397,34 @@ def _build_split_dim_seed(
             finally:
                 set_nccl_topo_config(prev)
 
-            node_placements: dict[str, Placement] = {}
+            node_strategies: dict[str, OpSpecSeed] = {}
             for node, strategy in solution.items():
-                placements = _first_output_placements(strategy.output_specs)
-                if placements is not None:
-                    node_placements[node.name] = placements[0]
-            cache[key] = node_placements
+                node_strategies[node.name] = _op_spec_to_seed(strategy)
+            cache[key] = node_strategies
         per_dim.append(cache[key])
 
-    seed: dict[str, tuple[Placement, ...]] = {}
+    seed: dict[str, StrategySeed] = {}
     for node in gm.graph.nodes:
         if node.op == "output":
             continue
-        seed[node.name] = tuple(
-            per_dim[i].get(node.name, Replicate()) for i in range(ndim)
+        output_placements = tuple(
+            (
+                first_output.placements[0]
+                if (strategy := per_dim[i].get(node.name)) is not None
+                and (first_output := _first_seeded_output(strategy)) is not None
+                and len(first_output.placements) == 1
+                else Replicate()
+            )
+            for i in range(ndim)
         )
+        per_dim_witnesses = [
+            strategies[node.name] for strategies in per_dim if node.name in strategies
+        ]
+        witness = (
+            _combine_op_spec_seeds(per_dim_witnesses)
+            if len(per_dim_witnesses) == ndim
+            else None
+        )
+        seed[node.name] = StrategySeed(output_placements, witness)
 
     return seed

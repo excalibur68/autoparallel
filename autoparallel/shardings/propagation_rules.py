@@ -21,6 +21,7 @@ import collections
 import itertools
 import math
 import operator
+from dataclasses import dataclass
 from typing import cast
 
 import torch
@@ -53,7 +54,26 @@ from torch.distributed.tensor.placement_types import (
 from ..cast_parametrization import dtype_cast  # noqa
 from .dtensor_sharding_helpers import _try_single_dim_strategy, get_op_strategy
 
-_strategy_seed: "dict[str, tuple[Placement, ...]] | None" = None
+
+@dataclass(frozen=True)
+class DTensorSpecSeed:
+    placements: tuple[Placement, ...]
+    tensor_meta: TensorMeta | None
+
+
+@dataclass(frozen=True)
+class OpSpecSeed:
+    output_specs: (DTensorSpecSeed | tuple[DTensorSpecSeed | None, ...] | None)
+    input_specs: tuple[DTensorSpecSeed | None, ...] | None
+
+
+@dataclass(frozen=True)
+class StrategySeed:
+    output_placements: tuple[Placement, ...]
+    witness: OpSpecSeed | None
+
+
+_strategy_seed: "dict[str, StrategySeed] | None" = None
 _strategy_radius: "int | dict[str, int] | None" = None
 _current_seed_node: "str | None" = None
 
@@ -87,9 +107,10 @@ def within_strategy_seed_ball(placements) -> bool:
     node_name = _current_seed_node
     if node_name is None:
         return True
-    seed_placements = _strategy_seed.get(node_name)
-    if seed_placements is None:
+    seed = _strategy_seed.get(node_name)
+    if seed is None:
         return True
+    seed_placements = seed.output_placements
 
     radius = _strategy_radius
     if isinstance(radius, dict):
