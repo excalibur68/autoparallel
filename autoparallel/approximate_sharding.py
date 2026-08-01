@@ -5,11 +5,10 @@
 
 """Approximate sharding solver.
 
-Reduces the sharding ILP (see :mod:`optimize_sharding`) to a pairwise MRF over the
-per-node output-strategy indices and solves it with tree-reweighted message passing
-(TRW-S) plus local-search polish, replacing only the CBC/ILP *solve*. It reuses the
-strategies / decision variables / constraints built by ``ShardingOptimizer`` and writes
-its assignment back into the PuLP variables, so it is scored by ``pulp.value(prob.objective)``.
+Reduces the sharding problem to a pairwise MRF over per-node output-strategy
+indices and solves it with tree-reweighted message passing (TRW-S) plus
+local-search polish. It can either reuse eagerly built costs and PuLP constraints
+or derive constraint topology and compute costs on demand without building PuLP.
 """
 
 import logging
@@ -486,7 +485,7 @@ class ApproximateShardingSolver:
 
         # 1. inf-cost forbidden (== add_inf_cost_constraint).
         for key, dv in opt.decision_vars.items():
-            if not math.isfinite(dv.cost) or dv.cost == 10000.0:
+            if not math.isfinite(dv.cost) or dv.cost == _INVALID_COST:
                 self.forbidden.add(key)
 
         # 2a. forward param-dtype forbidden (== add_grad_reduce_dtype_constraints

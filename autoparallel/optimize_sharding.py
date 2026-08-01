@@ -1463,7 +1463,10 @@ class ShardingOptimizer:
         unconstrained optimum."""
         memory_names = {"memory_constraint_high", "memory_constraint_low"}
         for name in names:
-            del self.prob.constraints[name]
+            if self.prob is not None:
+                del self.prob.constraints[name]
+            elif name not in memory_names:
+                raise RuntimeError("Named constraint removal requires an ILP/LP build")
             self._node_constraint_names.pop(name, None)
             if name in memory_names:
                 self._memory_constraint = None
@@ -2132,7 +2135,7 @@ class ShardingOptimizer:
         if self._memory_constraint is None:
             return
         if self.prob is None:
-            return  # approx (lite) build reads the factors from _constraint_log
+            return  # approx-only builds read the active memory state directly
         memory_factor_low, memory_factor_high = self._memory_constraint
 
         # Remove previous memory constraints before rebuilding

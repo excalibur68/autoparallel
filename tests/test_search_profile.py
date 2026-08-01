@@ -78,6 +78,27 @@ def test_validate_search_profile_args_rejects_invalid_combinations(values):
         validate_args(_args(*values))
 
 
+def test_validate_search_profile_args_rejects_lazy_non_approx():
+    args = parse_args(
+        [
+            "--model",
+            "llama1b",
+            "--mesh",
+            "8,8",
+            "--solver",
+            "ilp",
+            "--lazy-costs",
+            "true",
+            "--revision-label",
+            "test",
+            "--output",
+            "unused.json",
+        ]
+    )
+    with pytest.raises(ValueError, match="only with --solver approx"):
+        validate_args(args)
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -161,6 +182,9 @@ def test_llama1b_approx_search_e2e(tmp_path):
     assert math.isfinite(result["objective"])
     assert result["solution_nodes"] > 0
     assert len(result["placement_sha256"]) == 64
+    assert result["counts"]["decision_vars"] == 0
+    assert result["counts"]["pulp_variables"] == 0
+    assert result["counts"]["constraints"] == 0
     for name in (
         "graph_trace_s",
         "optimizer_init_s",

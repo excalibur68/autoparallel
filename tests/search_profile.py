@@ -76,6 +76,7 @@ def parse_args(argv=None):
     parser.add_argument("--mesh", help="Comma-separated LLaMA mesh dimensions")
     parser.add_argument("--moe-layout", choices=("2d",))
     parser.add_argument("--solver", choices=AutoParallel.SOLVER_CHOICES, required=True)
+    parser.add_argument("--lazy-costs", choices=("true", "false"))
     parser.add_argument("--revision-label", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--detailed-solution", action="store_true")
@@ -312,6 +313,8 @@ def cpu_model():
 
 
 def validate_args(args):
+    if args.lazy_costs is not None and args.solver != "approx":
+        raise ValueError("--lazy-costs is supported only with --solver approx")
     if args.model == "dsv3":
         if args.moe_layout != "2d" or args.mesh is not None:
             raise ValueError("dsv3 requires --moe-layout 2d and no --mesh")
@@ -398,6 +401,9 @@ def main(argv=None):
                 repeated_subgraphs=True,
                 dynamic=args.model == "dsv3",
                 solver=args.solver,
+                lazy_costs=(
+                    None if args.lazy_costs is None else args.lazy_costs == "true"
+                ),
             )
             enter_started = time.perf_counter()
             stack.enter_context(autop)
@@ -447,17 +453,28 @@ def main(argv=None):
             )
 
             fingerprint, solution_nodes = solution_fingerprint(solution)
-            objective = finite(pulp.value(opt.prob.objective))
-            violations = [
-                name
-                for name, constraint in opt.prob.constraints.items()
-                if not constraint.valid(1e-6)
-            ]
-            pulp_status = pulp.LpStatus.get(opt.prob.status, str(opt.prob.status))
-            solution_status = pulp.LpSolution.get(
-                getattr(opt.prob, "sol_status", None),
-                str(getattr(opt.prob, "sol_status", None)),
-            )
+            objective = finite(solver_profile["objective"])
+            violations = []
+            pulp_status = None
+            solution_status = None
+            if opt.prob is not None:
+                objective = finite(pulp.value(opt.prob.objective))
+                violations = [
+                    name
+                    for name, constraint in opt.prob.constraints.items()
+                    if not constraint.valid(1e-6)
+                ]
+                pulp_status = pulp.LpStatus.get(opt.prob.status, str(opt.prob.status))
+                solution_status = pulp.LpSolution.get(
+                    getattr(opt.prob, "sol_status", None),
+                    str(getattr(opt.prob, "sol_status", None)),
+                )
+            elif args.solver == "approx":
+                solution_status = (
+                    "Solution Found"
+                    if solver_profile["status"] == "Heuristic"
+                    else "No Solution Found"
+                )
             validation = {
                 "solver_status": solver_profile["status"],
                 "pulp_status": pulp_status,
@@ -477,7 +494,9 @@ def main(argv=None):
                         "strategy_nodes": len(opt.strats),
                         "decision_vars": len(opt.decision_vars),
                         "pulp_variables": len(opt.pulp_variables),
-                        "constraints": len(opt.prob.constraints),
+                        "constraints": (
+                            len(opt.prob.constraints) if opt.prob is not None else 0
+                        ),
                         "selected_keys": len(opt.selected_keys),
                     },
                 }
@@ -492,12 +511,13 @@ def main(argv=None):
             )
 
             if args.detailed_solution:
-                contributions = cost_contributions(opt)
                 result["solution_detail"] = solution_details(solution, autop.gm.graph)
-                result["cost_contributions"] = contributions
-                result["cost_contribution_sum"] = sum(
-                    row["total"] for row in contributions
-                )
+                if opt.decision_vars:
+                    contributions = cost_contributions(opt)
+                    result["cost_contributions"] = contributions
+                    result["cost_contribution_sum"] = sum(
+                        row["total"] for row in contributions
+                    )
             result["status"] = "success"
     except Exception as error:
         result["error"] = {
