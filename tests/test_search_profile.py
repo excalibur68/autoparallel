@@ -307,17 +307,30 @@ class TestRealDsv3SolverE2E(DTensorTestBase):
             )
 
         fingerprint, solution_nodes = solution_fingerprint(solution)
-        objective = finite(pulp.value(opt.prob.objective))
-        violations = [
-            name
-            for name, constraint in opt.prob.constraints.items()
-            if not constraint.valid(1e-6)
-        ]
-        pulp_status = pulp.LpStatus.get(opt.prob.status, str(opt.prob.status))
-        solution_status = pulp.LpSolution.get(
-            getattr(opt.prob, "sol_status", None),
-            str(getattr(opt.prob, "sol_status", None)),
-        )
+        profile_key = "approximate" if solver == "approx" else solver
+        solver_profile = opt.profile[profile_key]
+        objective = finite(solver_profile["objective"])
+        violations = []
+        pulp_status = None
+        solution_status = None
+        if opt.prob is not None:
+            objective = finite(pulp.value(opt.prob.objective))
+            violations = [
+                name
+                for name, constraint in opt.prob.constraints.items()
+                if not constraint.valid(1e-6)
+            ]
+            pulp_status = pulp.LpStatus.get(opt.prob.status, str(opt.prob.status))
+            solution_status = pulp.LpSolution.get(
+                getattr(opt.prob, "sol_status", None),
+                str(getattr(opt.prob, "sol_status", None)),
+            )
+        elif solver == "approx":
+            solution_status = (
+                "Solution Found"
+                if solver_profile["status"] == "Heuristic"
+                else "No Solution Found"
+            )
         validate_solution(
             solver,
             objective,
@@ -326,8 +339,6 @@ class TestRealDsv3SolverE2E(DTensorTestBase):
             pulp_status,
             solution_status,
         )
-        profile_key = "approximate" if solver == "approx" else solver
-        solver_profile = opt.profile[profile_key]
         result = {
             "solver": solver,
             "objective": objective,
