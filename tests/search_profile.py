@@ -111,8 +111,12 @@ def fake_cuda_context(stack):
 def make_llama(model_name, mesh_shape):
     from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 
-    if len(mesh_shape) != 2:
-        raise ValueError(f"PR521 LLaMA profiles require a 2D mesh, got {mesh_shape}")
+    names = {
+        2: ("dp", "tp"),
+        3: ("dp", "cp", "tp"),
+    }.get(len(mesh_shape))
+    if names is None:
+        raise ValueError(f"LLaMA profiles require a 2D or 3D mesh, got {mesh_shape}")
     seq_len = 2048
     vocab_size = 128256
     config = {
@@ -123,17 +127,16 @@ def make_llama(model_name, mesh_shape):
     }
     with torch.device("meta"):
         model = Transformer(TransformerModelArgs(**config))
-    names = ("dp", "tp")
     mesh = torch.distributed.device_mesh.init_device_mesh(
         "cuda", mesh_shape, mesh_dim_names=names
     )
-    batch_size = 2 * mesh_shape[0]
+    batch_size = 16
 
     def input_fn():
         return torch.randint(0, vocab_size, (batch_size, seq_len), device="cuda")
 
-    input_placement = (Shard(0), Replicate())
-    output_placement = (Shard(0), Shard(2))
+    input_placement = (Shard(0),) + (Replicate(),) * (len(mesh_shape) - 1)
+    output_placement = (Shard(0), Shard(2)) if len(mesh_shape) == 2 else input_placement
     expanded = {
         "family": "llama3",
         "config": config,
@@ -322,6 +325,8 @@ def validate_args(args):
     if args.mesh is None or args.moe_layout is not None:
         raise ValueError("LLaMA requires --mesh and no --moe-layout")
     mesh_shape = tuple(int(part) for part in args.mesh.split(","))
+    if len(mesh_shape) not in (2, 3):
+        raise ValueError(f"LLaMA requires a 2D or 3D mesh, got {mesh_shape}")
     world_size = math.prod(mesh_shape)
     if world_size != 64:
         raise ValueError(f"world size must be 64, got {world_size}")
