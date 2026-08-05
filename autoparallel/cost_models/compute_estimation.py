@@ -331,9 +331,16 @@ def compute_memory_cost(op, args, outs):
     return read_bytes + write_bytes
 
 
+def _node_value(node):
+    for key in ("val", "example_value"):
+        if key in node.meta:
+            return node.meta[key]
+    raise RuntimeError(f"FX node {node.name} has no example value")
+
+
 def _shard_args_for_node(node, strategy=None, rand_init=False):
-    args = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.args)
-    kwargs = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.kwargs)
+    args = tree_map_only(torch.fx.Node, _node_value, node.args)
+    kwargs = tree_map_only(torch.fx.Node, _node_value, node.kwargs)
 
     if strategy is None:
         return args, kwargs
@@ -365,7 +372,19 @@ def _shard_args_for_node(node, strategy=None, rand_init=False):
     return args, kwargs
 
 
+def _is_flex_local_map_hop(node):
+    local_map_kwargs = node.meta.get("local_map_kwargs", {})
+    return (
+        node.op == "call_function"
+        and isinstance(node.target, torch._ops.HigherOrderOperator)
+        and local_map_kwargs.get("alternatives") is not None
+    )
+
+
 def _has_zero_cost(node):
+    if _is_flex_local_map_hop(node):
+        return False
+
     if node.op != "call_function":
         return True
 
@@ -443,6 +462,11 @@ def estimate_strategy_runtime_cost(node, strategy):
     inputs according to the strategy. It then uses the device
     specifications to estimate the runtime cost of the node.
     """
+    if _is_flex_local_map_hop(node):
+        raise RuntimeError(
+            f"local_map node {node.name} requires optimizer-owned body cost"
+        )
+
     if _has_zero_cost(node):
         return 0
 
@@ -493,6 +517,23 @@ def estimate_strategy_runtime_cost(node, strategy):
     return result
 
 
+def estimate_local_map_body_runtime_cost(body, mesh):
+    from .collective_runtime_estimation import estimate_local_map_collective_cost
+
+    cost = 0.0
+    for node in body.graph.nodes:
+        if node.op in ("placeholder", "get_attr", "output"):
+            continue
+        collective_cost = estimate_local_map_collective_cost(node, mesh)
+        if collective_cost is not None:
+            cost += collective_cost
+            continue
+        if isinstance(node.target, torch._ops.HigherOrderOperator):
+            raise RuntimeError(f"Unsupported local_map higher-order op {node.target}")
+        cost += estimate_strategy_runtime_cost(node, strategy=None)
+    return cost
+
+
 def benchmark_strategy_runtime_cost(node, strategy):
     """
     This is the counterpart for estimate_strategy_runtime_cost
@@ -500,6 +541,9 @@ def benchmark_strategy_runtime_cost(node, strategy):
     cost. This is useful for debugging the cost model and for
     cases where estimate_strategy_runtime_cost is not accurate.
     """
+    if _is_flex_local_map_hop(node):
+        raise RuntimeError(f"Cannot benchmark local_map node {node.name} directly")
+
     if _has_zero_cost(node):
         return 0
 
