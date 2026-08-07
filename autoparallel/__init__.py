@@ -7,6 +7,7 @@ from autoparallel._context_parallel import (
     ContextParallelPlacements,
     context_parallel_attention_placements,
     make_context_parallel,
+    make_context_parallel_body,
     make_context_parallel_sdpa,
 )
 from autoparallel.api import AutoParallel, auto_parallel
@@ -22,6 +23,7 @@ __all__ = [
     "context_parallel_attention_placements",
     "ForwardInputs",
     "make_context_parallel",
+    "make_context_parallel_body",
     "make_context_parallel_sdpa",
     "with_sharding_constraint",
 ]
