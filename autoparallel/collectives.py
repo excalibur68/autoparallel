@@ -15,27 +15,27 @@ from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
 from torch.distributed.distributed_c10d import GroupName
 from torch.distributed.tensor.placement_types import Placement
 
-_FLEX_LOCAL_MAP_ALTERNATIVES_ATTR = "_autoparallel_flex_local_map_alternatives"
-
 
 # Dynamo's local_map HOP only preserves placement kwargs in FX metadata.
 # Carry flex metadata on out_placements so slicing in the HOP wrapper keeps it.
 class _FlexLocalMapOutPlacements(tuple):
+    alternatives: tuple[dict[str, Any], ...]
+
     def __new__(cls, values, alternatives):
         obj = super().__new__(cls, values)
-        setattr(obj, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR, alternatives)
+        obj.alternatives = alternatives
         return obj
 
     def __getnewargs__(self):
         # AutoParallel deep-copies the user model (api.py), which reconstructs
         # this tuple subclass via copyreg.__newobj__ -> __new__(cls, *args).
         # The two-arg __new__ requires we surface `alternatives` here too.
-        return (tuple(self), getattr(self, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR))
+        return (tuple(self), self.alternatives)
 
     def __getitem__(self, item):
         result = super().__getitem__(item)
         if isinstance(item, slice):
-            return type(self)(result, getattr(self, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR))
+            return type(self)(result, self.alternatives)
         return result
 
 
@@ -46,9 +46,8 @@ def get_flex_local_map_alternatives(local_map_kwargs):
 
     for key in ("out_placements", "in_placements"):
         placements = local_map_kwargs.get(key)
-        alternatives = getattr(placements, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR, None)
-        if alternatives is not None:
-            return alternatives
+        if isinstance(placements, _FlexLocalMapOutPlacements):
+            return placements.alternatives
 
     return None
 

@@ -9,10 +9,15 @@ from contextlib import ExitStack
 import torch
 from torch._dynamo.functional_export import _dynamo_graph_capture_for_export
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
-from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
+from torch._subclasses.fake_tensor import (
+    FakeTensor,
+    FakeTensorMode,
+    unset_fake_temporarily,
+)
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._op_schema import OpSpec
 from torch.distributed.tensor.placement_types import Replicate
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .cast_parametrization import set_dtype_cast
 from .collectives import get_flex_local_map_alternatives, local_map
@@ -302,10 +307,21 @@ def _example_args(forward, trace_info):
 
 
 def _trace_alternative_cost_graph(forward, alternative, mesh, stack):
-    from torch._higher_order_ops.local_map import redistribute_fw_inputs
-
     trace_info = forward.meta["local_map_kwargs"][_TRACE_INFO]
     example_args = _example_args(forward, trace_info)
+    fake_mode = FakeTensorMode(shape_env=ShapeEnv())
+    with unset_fake_temporarily(), fake_mode:
+        example_args = torch.utils._pytree.tree_map_only(
+            torch.Tensor,
+            lambda value: torch.empty_strided(
+                tuple(int(dim) for dim in value.shape),
+                tuple(int(stride) for stride in value.stride()),
+                dtype=value.dtype,
+                device=value.device,
+                requires_grad=value.requires_grad,
+            ),
+            example_args,
+        )
     selected_kwargs = _selected_kwargs(
         forward.meta["local_map_kwargs"], alternative, mesh
     )
@@ -328,21 +344,19 @@ def _trace_alternative_cost_graph(forward, alternative, mesh, stack):
             f"{alternative['name']!r} changed its differentiable outputs"
         )
 
-    fake_mode = next(
-        value.fake_mode
-        for value in torch.utils._pytree.tree_leaves(example_args)
-        if isinstance(value, FakeTensor)
+    local_args = tuple(
+        _value(node) for node in selected_body.graph.nodes if node.op == "placeholder"
     )
-    with unset_fake_temporarily(), fake_mode:
-        local_args = redistribute_fw_inputs(
-            example_args, selected_kwargs["in_placements"], mesh
-        )
-    joint = aot_export_joint_with_descriptors(
-        stack,
-        selected_body,
-        local_args,
-        decompositions=_get_decomp_table(),
-    ).graph_module
+    fake_mode = next(
+        value.fake_mode for value in local_args if isinstance(value, FakeTensor)
+    )
+    with fake_mode:
+        joint = aot_export_joint_with_descriptors(
+            stack,
+            selected_body,
+            local_args,
+            decompositions=_get_decomp_table(),
+        ).graph_module
     cleanup_graph(joint)
     _replace_view_mm_view_with_einsum(joint)
     _add_alias(joint, version="v2")

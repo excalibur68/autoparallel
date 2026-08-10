@@ -22,7 +22,10 @@ from torch.distributed.tensor.placement_types import (
 )
 
 from autoparallel._flex_local_map import _body
-from autoparallel._testing.models.dsv3 import functional_feed_forward
+from autoparallel._testing.models.dsv3 import (
+    _run_experts_grouped_mm,
+    functional_feed_forward,
+)
 from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.collectives import (
     all_gather,
@@ -815,6 +818,86 @@ class AttentionCostReference(nn.Module):
         )
 
 
+def _balanced_expert_ffn(x, w1, w3, w2):
+    num_tokens = x.shape[1]
+    tokens_per_expert = torch.full(
+        (x.shape[0],), num_tokens, dtype=torch.int32, device=x.device
+    )
+    return _run_experts_grouped_mm(
+        w1,
+        w2,
+        w3,
+        x.flatten(0, 1),
+        tokens_per_expert,
+    ).view_as(x)
+
+
+def _balanced_moe_no_ep_body(x, w1, w3, w2):
+    return (_balanced_expert_ffn(x, w1, w3, w2),)
+
+
+def _balanced_moe_ep_local(x, w1, w3, w2, ep_size):
+    local_experts = w1.shape[0]
+    x = x.view(ep_size, local_experts, -1, x.shape[-1])
+    x = x.permute(1, 0, 2, 3).flatten(1, 2)
+    x = _balanced_expert_ffn(x, w1, w3, w2)
+    return x.unflatten(1, (ep_size, -1)).permute(1, 0, 2, 3).flatten(0, 2)
+
+
+def _balanced_moe_ep_body(x, w1, w3, w2):
+    original_shape = x.shape
+    ep_size = axis_size("tp")
+    x = all_to_all(x.flatten(0, 1), None, None, "tp")
+    x = _balanced_moe_ep_local(x, w1, w3, w2, ep_size)
+    x = all_to_all(x, None, None, "tp")
+    return (x.view(original_shape),)
+
+
+class FlexLocalMapBalancedMoECostParity(nn.Module):
+    def __init__(self, mesh):
+        super().__init__()
+        replicated = (Replicate(), Replicate())
+        no_ep_data = (Shard(1), Replicate())
+        ep_data = (Shard(1), Shard(1))
+        ep_weights = (Replicate(), Shard(0))
+        self.mapped = flex_local_map(
+            _balanced_moe_no_ep_body,
+            alternatives=[
+                {
+                    "name": "no_ep",
+                    "in_placements": (no_ep_data, replicated, replicated, replicated),
+                    "out_placements": (no_ep_data,),
+                },
+                {
+                    "name": "ep",
+                    "fn": _balanced_moe_ep_body,
+                    "in_placements": (ep_data, ep_weights, ep_weights, ep_weights),
+                    "out_placements": (ep_data,),
+                },
+            ],
+            device_mesh=mesh,
+        )
+
+    def forward(self, x, w1, w3, w2):
+        return self.mapped(x, w1, w3, w2)[0]
+
+
+class BalancedExpertFFNCostReference(nn.Module):
+    def forward(self, x, w1, w3, w2):
+        return _balanced_expert_ffn(x, w1, w3, w2)
+
+
+class BalancedExpertFFNEPCostReference(nn.Module):
+    def __init__(self, ep_size):
+        super().__init__()
+        self.ep_size = ep_size
+
+    def forward(self, x, w1, w3, w2):
+        original_shape = x.shape
+        x = _balanced_moe_ep_local(x.flatten(0, 1), w1, w3, w2, self.ep_size)
+        return x.view(original_shape)
+
+
 class PlainLocalMapReference(nn.Module):
     def __init__(
         self,
@@ -1164,6 +1247,23 @@ def _reference_graph_cost(opt):
     return cost, breakdown
 
 
+def _unsharded_graph_cost(model, input_fn, mesh):
+    autop = AutoParallel(model, input_fn, mesh)
+    try:
+        autop.build_model_graph()
+        cost = 0.0
+        breakdown = []
+        for node in autop.gm.graph.nodes:
+            if node.op != "call_function":
+                continue
+            node_cost = estimate_strategy_runtime_cost(node, strategy=None)
+            cost += node_cost
+            breakdown.append((node.name, str(node.target), node_cost))
+        return cost, breakdown
+    finally:
+        autop.stack.close()
+
+
 def _local_shape(shape, placements, mesh_shape):
     shape = list(shape)
     for mesh_size, placement in zip(mesh_shape, placements):
@@ -1314,6 +1414,93 @@ def test_flex_local_map_attention_cost_matches_plain_region(
     assert actual == pytest.approx(
         expected, rel=1e-9, abs=1e-9
     ), f"plain={plain_breakdown}, flex={flex_breakdown}"
+
+
+@apply_cuda_patches
+def test_flex_local_map_balanced_moe_cost_matches_plain_regions(
+    device_mesh_2d, device="cuda"
+):
+    num_experts = 64
+    tokens_per_expert = 196608
+    dim = 256
+    hidden_dim = 256
+    dtype = torch.bfloat16
+    dp_size, ep_size = device_mesh_2d.shape
+
+    def input_tensors(data_experts, tokens, weight_experts=None):
+        if weight_experts is None:
+            weight_experts = data_experts
+        shapes = (
+            (data_experts, tokens, dim),
+            (weight_experts, hidden_dim, dim),
+            (weight_experts, hidden_dim, dim),
+            (weight_experts, dim, hidden_dim),
+        )
+        return tuple(
+            torch.randn(*shape, dtype=dtype, device=device, requires_grad=True)
+            for shape in shapes
+        )
+
+    def flex_input_fn():
+        return input_tensors(num_experts, tokens_per_expert)
+
+    reference_costs = {}
+    reference_breakdowns = {}
+    reference_cases = (
+        (
+            "no_ep",
+            BalancedExpertFFNCostReference(),
+            tokens_per_expert // dp_size,
+            num_experts,
+        ),
+        (
+            "ep",
+            BalancedExpertFFNEPCostReference(ep_size),
+            tokens_per_expert // (dp_size * ep_size),
+            num_experts // ep_size,
+        ),
+    )
+    for name, reference_model, local_tokens, local_experts in reference_cases:
+
+        def reference_input_fn(local_tokens=local_tokens, local_experts=local_experts):
+            return input_tensors(num_experts, local_tokens, local_experts)
+
+        reference_costs[name], reference_breakdowns[name] = _unsharded_graph_cost(
+            reference_model, reference_input_fn, device_mesh_2d
+        )
+
+    with torch.device("meta"):
+        flex_model = FlexLocalMapBalancedMoECostParity(device_mesh_2d)
+    with AutoParallel(flex_model, flex_input_fn, device_mesh_2d) as flex_autop:
+        opt = flex_autop.sharding_optimizer
+        forward, backward = _flex_fw_bw_nodes(list(opt.strats))
+        costs = opt.flex_local_map_costs
+        actual = {
+            name: costs[(forward, index)] + costs[(backward, index)]
+            for index, name in enumerate(("no_ep", "ep"))
+        }
+        comm_bytes = (
+            num_experts
+            * (tokens_per_expert // (dp_size * ep_size))
+            * dim
+            * dtype.itemsize
+        )
+        communication = 4 * collective_comm_cost(
+            "all_to_all",
+            comm_bytes,
+            tuple(device_mesh_2d.shape),
+            1,
+            MeshTopoInfo.build_from_mesh(device_mesh_2d),
+        )
+
+    expected = {
+        "no_ep": reference_costs["no_ep"],
+        "ep": reference_costs["ep"] + communication,
+    }
+    assert communication > 0
+    assert actual == pytest.approx(
+        expected, rel=1e-9, abs=1e-9
+    ), f"plain={reference_breakdowns}, communication={communication}, flex={costs}"
 
 
 @apply_cuda_patches

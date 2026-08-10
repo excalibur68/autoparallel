@@ -19,7 +19,7 @@ from torch.distributed.tensor._collective_utils import (
 )
 from torch.distributed.tensor.placement_types import Partial, Shard
 
-from .compute_estimation import compute_read_write_time
+from .compute_estimation import _concretize_unbacked_numel, compute_read_write_time
 from .nccl_cost_model import (
     NCCLTopoConfig,
     derive_mesh_dim_topo,
@@ -51,7 +51,9 @@ def _node_value(value):
     raise RuntimeError(f"FX node {value.name} has no example value")
 
 
-def estimate_local_map_collective_cost(node, mesh) -> float | None:
+def estimate_local_map_collective_cost(
+    node, mesh, balanced_tokens=None
+) -> float | None:
     if node.op != "call_function":
         return None
 
@@ -106,7 +108,12 @@ def estimate_local_map_collective_cost(node, mesh) -> float | None:
     tensor = _node_value(tensor_value)
     if not isinstance(tensor, torch.Tensor):
         raise RuntimeError(f"Collective {node.target} has no tensor metadata")
-    comm_bytes = tensor.numel() * tensor.element_size()
+    numel = (
+        tensor.numel()
+        if balanced_tokens is None
+        else _concretize_unbacked_numel(tensor, balanced_tokens)
+    )
+    comm_bytes = numel * tensor.element_size()
     return collective_comm_cost(
         collective,
         int(comm_bytes),
