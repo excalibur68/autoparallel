@@ -214,7 +214,19 @@ def _normalize_cluster_layer(cluster_roots):
         root_to_linked[best] = linked_nodes
 
 
-def _extract_shape_dtype(node: torch.fx.Node) -> tuple[list | None, str | None]:
+def _json_shape(shape) -> list[int | str]:
+    result = []
+    for dim in shape:
+        if isinstance(dim, torch.SymInt):
+            result.append(int(dim.node.hint) if dim.node.hint is not None else str(dim))
+        else:
+            result.append(dim)
+    return result
+
+
+def _extract_shape_dtype(
+    node: torch.fx.Node,
+) -> tuple[list[int | str] | None, str | None]:
     """Extract shape and dtype from the node's fake tensor value."""
     val = node.meta.get("val")
     if val is None:
@@ -222,14 +234,14 @@ def _extract_shape_dtype(node: torch.fx.Node) -> tuple[list | None, str | None]:
         # val was stripped during save)
         tm = node.meta.get("tensor_meta")
         if tm is not None:
-            return list(tm.shape), str(tm.dtype).removeprefix("torch.")
+            return _json_shape(tm.shape), str(tm.dtype).removeprefix("torch.")
         return None, None
     if isinstance(val, torch.Tensor):
-        return list(val.shape), str(val.dtype).removeprefix("torch.")
+        return _json_shape(val.shape), str(val.dtype).removeprefix("torch.")
     if isinstance(val, (list, tuple)) and val:
         first = next((v for v in val if isinstance(v, torch.Tensor)), None)
         if first is not None:
-            return list(first.shape), str(first.dtype).removeprefix("torch.")
+            return _json_shape(first.shape), str(first.dtype).removeprefix("torch.")
     return None, None
 
 

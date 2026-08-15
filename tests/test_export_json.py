@@ -3,10 +3,13 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
+
 import torch
 from conftest import apply_cuda_patches
 from torch import nn
 from torch.distributed.tensor.placement_types import Shard
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from autoparallel.api import AutoParallel
 from autoparallel.export_json import _get_layer_index, _normalize_cluster_layer
@@ -150,6 +153,8 @@ def test_export_json_produces_valid_structure(device_mesh_1d):
     for node in data["nodes"]:
         assert "name" in node
         assert "op" in node
+        if "shape" in node:
+            assert all(isinstance(dim, int) for dim in node["shape"])
 
     # Summary should have cost fields
     assert "total" in data["summary"]
@@ -158,3 +163,29 @@ def test_export_json_produces_valid_structure(device_mesh_1d):
 
     # Mesh should have shape
     assert "shape" in data["mesh"]
+
+
+@apply_cuda_patches
+def test_export_json_serializes_unbacked_symbolic_shape(device_mesh_1d):
+    dim = 64
+    with torch.device("meta"):
+        model = _RepeatedLayerModel(dim, n_layers=2)
+
+    autop = _setup_autop(model, dim, device_mesh_1d)
+    with autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        autop.sharding_optimizer.get_solution()
+
+        node = next(
+            node
+            for node in autop.sharding_optimizer.graph.nodes
+            if isinstance(node.meta.get("val"), torch.Tensor)
+        )
+        symbolic_dim = ShapeEnv().create_unbacked_symint()
+        node.meta["val"] = torch.empty((symbolic_dim, 4), device="meta")
+        data = autop.sharding_optimizer.get_json()
+
+    json.dumps(data)
+    exported_node = next(item for item in data["nodes"] if item["name"] == node.name)
+    assert exported_node["shape"] == [str(symbolic_dim), 4]
