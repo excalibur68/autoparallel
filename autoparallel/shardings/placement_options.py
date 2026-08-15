@@ -397,9 +397,6 @@ def get_local_map_placement_option(
         mesh,
         None,
     ), "Not yet implemented"
-    assert "call_local_map" in str(node.target) or "call_local_map_backward" in str(
-        node.target
-    )
     in_specs = []
     num_activation_inputs = len(user_args) - len(in_placements)
     # activations are always replicated
