@@ -1789,6 +1789,7 @@ def _init_weights_layers(
         if seed is not None:
             torch.manual_seed(seed)
         if layer is not None:
+            layer = getattr(layer, "_checkpoint_wrapped_module", layer)
             assert isinstance(layer, TransformerBlock)
             layer.init_weights(buffer_device)  # type: ignore[arg-type]
 
