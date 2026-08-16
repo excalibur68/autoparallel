@@ -25,6 +25,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh
 from torch.export._trace import _restore_state_dict
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.utils.checkpoint import CheckpointPolicy
 
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
@@ -95,6 +96,42 @@ def _boxed_nop_preserve_node_meta(fx_g, example_inputs, tag_forward=False):
 
     run._boxed_call = True
     return run
+
+
+def _save_autoparallel_collectives_for_first_partition(
+    gm: torch.fx.GraphModule,
+) -> None:
+    """Apply the GraphTrainer collective save predicate before AP partitioning."""
+    collective_targets = {
+        torch.ops._c10d_functional.all_gather_into_tensor.default: "all_gather",
+        torch.ops._dtensor.shard_dim_alltoall.default: "shard_dim_alltoall",
+    }
+    counts = {"all_gather": 0, "shard_dim_alltoall": 0, "wait_tensor": 0}
+    for node in gm.graph.nodes:
+        if (
+            "recompute" not in node.meta
+            or node.meta.get("autograd_backward", False)
+            or node.meta.get("partitioner_tag") == "is_backward"
+            or node.target not in collective_targets
+        ):
+            continue
+        node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+        counts[collective_targets[node.target]] += 1
+        for user in node.users:
+            if (
+                "recompute" in user.meta
+                and user.target is torch.ops._c10d_functional.wait_tensor.default
+            ):
+                user.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+                counts["wait_tensor"] += 1
+
+    counts["collective_total"] = counts["all_gather"] + counts["shard_dim_alltoall"]
+    counts["node_total"] = counts["collective_total"] + counts["wait_tensor"]
+    if counts["collective_total"] == 0:
+        raise RuntimeError("AP collective MUST_SAVE hook matched no forward collectives")
+    global _ap_collective_must_save_audit
+    _ap_collective_must_save_audit = counts
+    logger.info("AP collective MUST_SAVE first-partition audit: %s", counts)
 
 
 @contextmanager
@@ -532,6 +569,7 @@ class AutoParallel:
         mark_fsdp_all_gather_recomputation(
             self.parallel_gm.graph, self.reshard_after_forward
         )
+        _save_autoparallel_collectives_for_first_partition(self.parallel_gm)
 
         fw_compiler_fn = partial(self.compiler_fn, tag_forward=True)
 
